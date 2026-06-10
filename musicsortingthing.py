@@ -50,6 +50,37 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 
+# ---------------------------------------------------------------------------
+# Terminal colours (ANSI 16-colour palette; disabled when not a TTY)
+# ---------------------------------------------------------------------------
+
+def _supports_color() -> bool:
+    import sys
+    if not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
+        return False
+    if sys.platform == "win32":
+        # Enable VT processing on Windows 10+
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        except Exception:
+            pass
+    return True
+
+_COLOR = _supports_color()
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _COLOR else text
+
+def clr_gray(t: str) -> str:    return _c("90", t)
+def clr_yellow(t: str) -> str:  return _c("33", t)
+def clr_red(t: str) -> str:     return _c("31", t)
+def clr_green(t: str) -> str:   return _c("32", t)
+def clr_bold(t: str) -> str:    return _c("1",  t)
+def clr_cyan(t: str) -> str:    return _c("36", t)
+
+
 AUDIO_EXTENSIONS = {
     ".mp3",
     ".flac",
@@ -226,12 +257,36 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+class _ColorFormatter(logging.Formatter):
+    _LEVEL_COLORS = {
+        logging.DEBUG:    "90",   # gray
+        logging.INFO:     "90",   # gray
+        logging.WARNING:  "33",   # yellow
+        logging.ERROR:    "31",   # red
+        logging.CRITICAL: "31",   # red
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = super().format(record)
+        if not _COLOR:
+            return msg
+        # Color only the levelname token, leave the timestamp plain
+        color = self._LEVEL_COLORS.get(record.levelno, "0")
+        colored_level = f"\033[{color}m{record.levelname}\033[0m"
+        # The formatted string contains the literal levelname; replace first occurrence
+        return msg.replace(record.levelname, colored_level, 1)
+
+
 def configure_logging(level_name: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level_name.upper()),
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        _ColorFormatter(
+            fmt="%(asctime)s | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     )
+    logging.root.setLevel(getattr(logging, level_name.upper()))
+    logging.root.handlers = [handler]
 
 
 def normalize_root(root: Path) -> Path:
@@ -524,20 +579,20 @@ def evaluate_album_priority(score_a: dict, score_b: dict) -> int:
 
 
 def prompt_user_conflict_resolution(album: str, score_a: dict, score_b: dict) -> str:
-    print(f"\n[!] CONFLICT: Two artists claim ownership of the album '{album}' with equal priority weights.")
-    
-    def print_option(label, score_data):
+    print(clr_yellow(f"\n[!] CONFLICT: Two artists claim ownership of the album '{album}' with equal priority weights."))
+
+    def print_option(label, score_data, color_fn):
         size_mb = score_data["total_size"] / (1024 * 1024)
-        print(f"  Option {label}: Artist '{score_data['artist_name']}'")
-        print(f"    - Track Count: {score_data['track_count']}")
-        print(f"    - Total Size: {size_mb:.2f} MB")
-        print(f"    - Metadata Richness Index: {score_data['richness_score']}")
-        print(f"    - Valid 'Album Artist' Matches: {score_data['album_artist_matches']}/{score_data['track_count']}")
-        
-    print_option("1", score_a)
-    print_option("2", score_b)
-    print("  Option 3: Enter a custom Album Artist name")
-    
+        print(f"  Option {clr_bold(label)}: Artist {color_fn(repr(score_data['artist_name']))}")
+        print(clr_gray(f"    - Track Count: {score_data['track_count']}"))
+        print(clr_gray(f"    - Total Size: {size_mb:.2f} MB"))
+        print(clr_gray(f"    - Metadata Richness Index: {score_data['richness_score']}"))
+        print(clr_gray(f"    - Valid 'Album Artist' Matches: {score_data['album_artist_matches']}/{score_data['track_count']}"))
+
+    print_option("1", score_a, clr_red)
+    print_option("2", score_b, clr_green)
+    print(f"  Option {clr_bold('3')}: Enter a custom Album Artist name")
+
     while True:
         choice = input("\nWhich artist should be the Main Artist? Enter 1, 2, or 3: ").strip()
         if choice == "1":
@@ -550,7 +605,7 @@ def prompt_user_conflict_resolution(album: str, score_a: dict, score_b: dict) ->
                 return f"CUSTOM:{custom}"
             print("Name cannot be empty.")
         else:
-            print("Please enter 1, 2, or 3.")
+            print(clr_yellow("Please enter 1, 2, or 3."))
 
 
 _LOOKALIKE_TABLE = str.maketrans({
@@ -603,7 +658,8 @@ def get_track_info_line(path: Path) -> str:
         if duration_str:
             info_parts.append(duration_str)
         info_parts.append(f"{size_mb:.1f} MB")
-        return f"{title}  [{' | '.join(info_parts)}]"
+        meta_tag = clr_gray(f"[{' | '.join(info_parts)}]")
+        return f"{title}  {meta_tag}"
     except Exception:
         return path.name
 
@@ -680,17 +736,17 @@ def prompt_artist_merge(album: str, existing_artist: str, new_artist: str, root:
                         pass
                 print(f"    {i}. {line}")
 
-    print(f"\n[!] PARTIAL ARTIST MATCH: '{existing_artist}' and '{new_artist}' may be the same artist.")
-    print(f"    (Triggered while adding tracks to '{album}')")
-    print(f"\n  '{existing_artist}' — tracks already in library:")
+    print(clr_yellow(f"\n[!] PARTIAL ARTIST MATCH: '{existing_artist}' and '{new_artist}' may be the same artist."))
+    print(clr_gray(f"    (Triggered while adding tracks to '{album}')"))
+    print(f"\n  {clr_red(existing_artist)} — tracks already in library:")
     list_tracks(existing_artist)
-    print(f"\n  '{new_artist}' — tracks already in library:")
+    print(f"\n  {clr_green(new_artist)} — tracks already in library:")
     list_tracks(new_artist)
-    print("\nOptions:")
-    print(f"  1 = Keep '{existing_artist}' (update new tracks to match)")
-    print(f"  2 = Use '{new_artist}' (update existing tracks to match)")
-    print(f"  3 = Enter a custom artist name (update ALL tracks in both)")
-    print(f"  Enter = Skip for now")
+    print(clr_bold("\nOptions:"))
+    print(f"  {clr_bold('1')} = Keep {clr_red(repr(existing_artist))} (update new tracks to match)")
+    print(f"  {clr_bold('2')} = Use {clr_green(repr(new_artist))} (update existing tracks to match)")
+    print(f"  {clr_bold('3')} = Enter a custom artist name (update ALL tracks in both)")
+    print(f"  {clr_gray('Enter')} = Skip for now")
 
     while True:
         choice = input("Your choice: ").strip()
@@ -706,7 +762,7 @@ def prompt_artist_merge(album: str, existing_artist: str, new_artist: str, root:
         elif choice == "":
             return None
         else:
-            print("Please enter 1, 2, 3, or press Enter to skip.")
+            print(clr_yellow("Please enter 1, 2, 3, or press Enter to skip."))
 
 
 def find_partial_album_matches(search_dir: Path, album_name: str) -> list:
@@ -731,19 +787,19 @@ def find_partial_album_matches(search_dir: Path, album_name: str) -> list:
 def prompt_album_merge(new_album: str, existing_album: str, artist: str, search_dir: Path) -> Optional[str]:
     existing_tracks = get_album_track_list(search_dir / existing_album)
 
-    print(f"\n[!] PARTIAL ALBUM MATCH detected:")
+    print(clr_yellow(f"\n[!] PARTIAL ALBUM MATCH detected:"))
     if artist:
-        print(f"  Artist: '{artist}'")
-    print(f"  Existing album: '{existing_album}' ({len(existing_tracks)} track(s))")
+        print(f"  Artist: {clr_cyan(repr(artist))}")
+    print(f"  Existing album: {clr_red(repr(existing_album))} ({len(existing_tracks)} track(s))")
     for i, t in enumerate(existing_tracks, 1):
         print(f"    {i}. {get_track_info_line(t)}")
-    print(f"  New album:      '{new_album}'")
-    print("\nOptions:")
-    print(f"  1 = Merge into existing '{existing_album}' (update new tracks' album tag)")
-    print(f"  2 = Keep '{new_album}' as a separate album")
-    print(f"  3 = Enter a custom album name (update ALL tracks in both)")
-    print(f"  4 = Ignore ALL partial matches for '{new_album}' (always keep separate)")
-    print(f"  Enter = Skip for now")
+    print(f"  New album:      {clr_green(repr(new_album))}")
+    print(clr_bold("\nOptions:"))
+    print(f"  {clr_bold('1')} = Merge into existing {clr_red(repr(existing_album))} (update new tracks' album tag)")
+    print(f"  {clr_bold('2')} = Keep {clr_green(repr(new_album))} as a separate album")
+    print(f"  {clr_bold('3')} = Enter a custom album name (update ALL tracks in both)")
+    print(f"  {clr_bold('4')} = Ignore ALL partial matches for {clr_green(repr(new_album))} (always keep separate)")
+    print(f"  {clr_gray('Enter')} = Skip for now")
 
     while True:
         choice = input("Your choice: ").strip()
@@ -761,7 +817,7 @@ def prompt_album_merge(new_album: str, existing_album: str, artist: str, search_
         elif choice == "":
             return None
         else:
-            print("Please enter 1, 2, 3, 4, or press Enter to skip.")
+            print(clr_yellow("Please enter 1, 2, 3, 4, or press Enter to skip."))
 
 
 def _resolve_album_partial_match(
@@ -1324,7 +1380,7 @@ def move_file(path: Path, destination_dir: Path, target_stem: str, root: Path, d
     # track). Delete it instead of creating a "(1)" copy.
     if canonical.exists() and canonical.resolve() != path.resolve():
         if path.parent.resolve() == destination_dir.resolve():
-            logging.info(
+            logging.warning(
                 "Duplicate in place: '%s' matches existing '%s' — removing source.",
                 path.name, canonical.name,
             )
@@ -1848,7 +1904,7 @@ def process_image(
                     shutil.move(str(img_path), str(dest_path))
                     logging.info("Moved stray image '%s' -> '%s'", img_path.name, dest_path)
                 else:
-                    logging.info("Image '%s' already exists in '%s'; skipping.", img_path.name, dest_dir)
+                    logging.warning("Image '%s' already exists in '%s'; skipping.", img_path.name, dest_dir)
             return
 
         mp3_peers = [p for p in img_path.parent.iterdir() if p.suffix.lower() == MP3_SUFFIX]
