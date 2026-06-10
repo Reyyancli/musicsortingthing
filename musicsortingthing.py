@@ -210,6 +210,11 @@ def parse_args() -> argparse.Namespace:
         help="Interactively view and remove entries from the deletion ignore list, then exit.",
     )
     parser.add_argument(
+        "--manage-album-ignorelist",
+        action="store_true",
+        help="Interactively view, remove, or add entries to the album partial-match ignore list, then exit.",
+    )
+    parser.add_argument(
         "--cleanup-cooldown",
         type=float,
         default=DEFAULT_CLEANUP_COOLDOWN_SECONDS,
@@ -1994,6 +1999,71 @@ def manage_ignorelist_interactive(root: Path) -> None:
         print("No valid item numbers entered.")
 
 
+def manage_album_ignorelist_interactive(root: Path) -> None:
+    ignore_set = load_album_ignore_list(root)
+
+    while True:
+        items = sorted(ignore_set)
+        print("\n=== Album Partial-Match Ignore List ===")
+        if items:
+            for i, (artist, album) in enumerate(items, 1):
+                label = f"{artist}/{album}" if artist else album
+                print(f"  {i}. {label}")
+        else:
+            print("  (empty)")
+
+        print("\nOptions:")
+        print("  r <numbers> = remove entries (e.g. 'r 1,3')")
+        print("  a           = add a new entry manually")
+        print("  Enter       = save and quit")
+
+        raw = input("\nChoice: ").strip()
+
+        if not raw:
+            break
+
+        if raw.lower().startswith("r"):
+            numbers_part = raw[1:].strip()
+            if not numbers_part:
+                print("Provide numbers after 'r', e.g. 'r 1,3'.")
+                continue
+            try:
+                indices = {int(x.strip()) for x in numbers_part.split(",") if x.strip()}
+            except ValueError:
+                print("Invalid numbers.")
+                continue
+            to_remove = {items[i - 1] for i in indices if 1 <= i <= len(items)}
+            if to_remove:
+                ignore_set -= to_remove
+                removed_labels = [f"{a}/{b}" if a else b for a, b in to_remove]
+                print(f"Removed: {', '.join(removed_labels)}")
+            else:
+                print("No valid item numbers.")
+
+        elif raw.lower() == "a":
+            artist_in = input("  Artist (leave blank for any): ").strip()
+            album_in = input("  Album name: ").strip()
+            if not album_in:
+                print("  Album name cannot be empty.")
+                continue
+            artist_san = sanitize_folder_name(artist_in) if artist_in else ""
+            album_san = sanitize_folder_name(album_in)
+            key = (artist_san, album_san)
+            if key in ignore_set:
+                label = f"{artist_san}/{album_san}" if artist_san else album_san
+                print(f"  '{label}' is already in the ignore list.")
+            else:
+                ignore_set.add(key)
+                label = f"{artist_san}/{album_san}" if artist_san else album_san
+                print(f"  Added '{label}'.")
+
+        else:
+            print("Unknown command. Use 'r <numbers>', 'a', or Enter to quit.")
+
+    save_album_ignore_list(root, ignore_set)
+    print(f"Album ignore list saved ({len(ignore_set)} entries).")
+
+
 def run_once(root: Path, dry_run: bool, hierarchy: bool, skip_art: bool, skip_cleanup: bool, ignore_list: Optional[set] = None, cleanup_cooldown: float = DEFAULT_CLEANUP_COOLDOWN_SECONDS) -> None:
     if ignore_list is None:
         ignore_list = set()
@@ -2106,6 +2176,10 @@ def main() -> int:
 
     if args.manage_ignorelist:
         manage_ignorelist_interactive(root)
+        return 0
+
+    if args.manage_album_ignorelist:
+        manage_album_ignorelist_interactive(root)
         return 0
 
     ignore_list = load_ignore_list(root)
