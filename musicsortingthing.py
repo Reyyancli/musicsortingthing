@@ -37,6 +37,7 @@ from pathlib import Path
 import difflib
 import json
 import unicodedata
+from collections import deque
 from typing import Dict, Iterable, Optional, Tuple
 
 try:
@@ -72,6 +73,8 @@ CLEANUP_INTERVAL_SECONDS = 30.0
 MP3_SUFFIX = ".mp3"
 ZIPS_DIR_NAME = "Zips"
 IGNORE_LIST_FILE = ".organizer_ignorelist.json"
+ALBUM_IGNORE_FILE = ".organizer_album_ignore.json"
+DEFAULT_CLEANUP_COOLDOWN_SECONDS = 120.0
 
 # Global Caches for Performance and Context Awareness
 ALBUM_MAIN_ARTIST_CACHE: Dict[tuple[str, str], str] = {}
@@ -85,6 +88,7 @@ ARTIST_PARTIAL_MATCH_ASKED: set = set()
 ALBUM_PARTIAL_MATCH_ASKED: set = set()
 ALBUM_MERGE_DECISIONS: Dict[tuple, str] = {}
 ALBUM_IGNORE_ALL: set = set()  # (artist_sanitized, album_sanitized) — skip all partial matches
+RECENT_ALBUM_DIRS: deque = deque(maxlen=20)  # album folders recently written to, newest first
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,29 @@ def save_ignore_list(root: Path, ignore_list: set) -> None:
             json.dump(sorted(ignore_list), f, indent=2)
     except Exception as exc:
         logging.warning("Could not save ignore list: %s", exc)
+
+
+def load_album_ignore_list(root: Path) -> set:
+    """Load the persisted 'ignore all partial matches' set for albums."""
+    path = root / ALBUM_IGNORE_FILE
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return {tuple(item.split("|", 1)) for item in data if "|" in item}
+    except Exception as exc:
+        logging.warning("Could not load album ignore list: %s", exc)
+    return set()
+
+
+def save_album_ignore_list(root: Path, album_ignore: set) -> None:
+    path = root / ALBUM_IGNORE_FILE
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sorted(f"{a}|{b}" for a, b in album_ignore), f, indent=2)
+    except Exception as exc:
+        logging.warning("Could not save album ignore list: %s", exc)
 
 
 def parse_args() -> argparse.Namespace:
@@ -181,6 +208,15 @@ def parse_args() -> argparse.Namespace:
         "--manage-ignorelist",
         action="store_true",
         help="Interactively view and remove entries from the deletion ignore list, then exit.",
+    )
+    parser.add_argument(
+        "--cleanup-cooldown",
+        type=float,
+        default=DEFAULT_CLEANUP_COOLDOWN_SECONDS,
+        help=(
+            "Seconds a non-media folder must remain unchanged before a deletion prompt is shown. "
+            f"Prevents prompts while new files are still being added (default: {DEFAULT_CLEANUP_COOLDOWN_SECONDS})"
+        ),
     )
     return parser.parse_args()
 
@@ -498,15 +534,18 @@ def prompt_user_conflict_resolution(album: str, score_a: dict, score_b: dict) ->
     print("  Option 3: Enter a custom Album Artist name")
     
     while True:
-        choice = input(
-            "\nWhich artist should be designated as the Main Artist? "
-            "Enter 1, 2, or type a custom Album Artist name: "
-        ).strip()
-        if choice in ("1", "2"):
-            return "A" if choice == "1" else "B"
-        if choice:
-            return f"CUSTOM:{choice}"
-        print("Please answer 1, 2, or type a non-empty artist name.")
+        choice = input("\nWhich artist should be the Main Artist? Enter 1, 2, or 3: ").strip()
+        if choice == "1":
+            return "A"
+        if choice == "2":
+            return "B"
+        if choice == "3":
+            custom = input("Enter custom Album Artist name: ").strip()
+            if custom:
+                return f"CUSTOM:{custom}"
+            print("Name cannot be empty.")
+        else:
+            print("Please enter 1, 2, or 3.")
 
 
 def _normalize_for_comparison(s: str) -> str:
@@ -518,7 +557,14 @@ def _normalize_for_comparison(s: str) -> str:
 
 
 def strings_partially_match(a: str, b: str, threshold: float = 0.82) -> bool:
-    return difflib.SequenceMatcher(None, _normalize_for_comparison(a), _normalize_for_comparison(b)).ratio() >= threshold
+    a_norm = _normalize_for_comparison(a)
+    b_norm = _normalize_for_comparison(b)
+    # Prefix check: one name is the start of the other (handles "Artist" vs "Artist (feat. X)").
+    # SequenceMatcher ratio collapses when lengths differ greatly, so check this first.
+    short, long = (a_norm, b_norm) if len(a_norm) <= len(b_norm) else (b_norm, a_norm)
+    if len(short) >= 4 and long.startswith(short):
+        return True
+    return difflib.SequenceMatcher(None, a_norm, b_norm).ratio() >= threshold
 
 
 def get_track_info_line(path: Path) -> str:
@@ -729,7 +775,8 @@ def _resolve_album_partial_match(
 
         if decision == "IGNORE_ALL":
             ALBUM_IGNORE_ALL.add(ignore_key)
-            logging.info("Ignoring all partial album matches for '%s'.", album_raw)
+            save_album_ignore_list(root, ALBUM_IGNORE_ALL)
+            logging.info("Ignoring all partial album matches for '%s' (saved).", album_raw)
             return None
 
         if decision is None:
@@ -1086,14 +1133,24 @@ def ensure_albumartist(path: Path, meta: dict) -> dict:
         return meta
 
     title = meta.get("title") or path.stem
+    track_artist = meta.get("artist") or ""
     print(f"\nTrack '{title}' (album: '{album or 'Unknown'}') has no album artist tag.")
+    if track_artist:
+        print(f"  a = Use track artist '{track_artist}'")
+    print(f"  Enter = Skip")
 
     while True:
-        value = input("Enter album artist (or press Enter to skip): ").strip()
+        value = input("Album artist (name / 'a' / Enter to skip): ").strip()
         if not value:
             MISSING_ALBUMARTIST_ASKED.add(path_key)
             return meta
-        break
+        if value.lower() == "a" and track_artist:
+            value = track_artist
+            break
+        if value.lower() == "a":
+            print("No track artist available.")
+        else:
+            break
 
     apply_all = False
     if album:
@@ -1241,6 +1298,24 @@ def move_associated_images(source_dir: Path, dest_dir: Path, dry_run: bool) -> N
 
 def move_file(path: Path, destination_dir: Path, target_stem: str, root: Path, dry_run: bool) -> Path:
     destination_dir.mkdir(parents=True, exist_ok=True)
+
+    canonical = destination_dir / f"{target_stem}{path.suffix}"
+
+    # If the canonical target already exists and the source is already sitting in the
+    # destination folder, the source is a stale duplicate (wrong filename format, same
+    # track). Delete it instead of creating a "(1)" copy.
+    if canonical.exists() and canonical.resolve() != path.resolve():
+        if path.parent.resolve() == destination_dir.resolve():
+            logging.info(
+                "Duplicate in place: '%s' matches existing '%s' — removing source.",
+                path.name, canonical.name,
+            )
+            if not dry_run:
+                path.unlink()
+            if "Orphan" not in canonical.parts:
+                RECENT_ALBUM_DIRS.appendleft(destination_dir)
+            return canonical
+
     destination = unique_destination_path(destination_dir, target_stem, path.suffix)
 
     if not within_root(destination, root):
@@ -1255,6 +1330,8 @@ def move_file(path: Path, destination_dir: Path, target_stem: str, root: Path, d
 
     shutil.move(str(path), str(destination))
     logging.info("Moved %s -> %s", path, destination)
+    if "Orphan" not in destination.parts:
+        RECENT_ALBUM_DIRS.appendleft(destination_dir)
     return destination
 
 
@@ -1349,12 +1426,14 @@ def convert_to_mp3(source: Path, destination_dir: Path, target_stem: str, root: 
         elif result.stderr:
             logging.debug("ffmpeg diagnostics for %s: %s", source.name, result.stderr.strip())
         temp_output.replace(final_output)
-        
+
         if art_info:
             inject_album_art(final_output, art_info[0], art_info[1])
-            
+
         source.unlink()
         logging.info("Converted %s -> %s and retained album art", source.name, final_output.name)
+        if "Orphan" not in final_output.parts:
+            RECENT_ALBUM_DIRS.appendleft(final_output.parent)
         return final_output
     except Exception:
         if temp_output.exists():
@@ -1497,7 +1576,14 @@ def process_archive(
         return
 
     if extraction_root.exists():
-        extraction_root = unique_directory_path(archive_storage_dir(root), archive_path.stem)
+        # Already extracted in a previous session; audio files there will be
+        # processed normally by the track handler — don't extract again.
+        logging.debug(
+            "Archive %s already extracted to %s; skipping re-extraction.",
+            archive_path.name, extraction_root.name,
+        )
+        processed_archives[archive_path] = stamp
+        return
 
     try:
         safe_extract_zip(archive_path, extraction_root)
@@ -1615,42 +1701,167 @@ def process_track(
     pending_tracks.pop(path, None)
 
 
+def prompt_root_image_destination(img_path: Path, root: Path) -> Optional[Path]:
+    """Ask user which album a stray root-level image belongs to.
+
+    Shows the last 5 unique recent album destinations numbered 1-5, plus a
+    custom fuzzy-search option.  Returns the chosen album folder, or None if
+    the user skips.
+    """
+    # Collect up to 5 unique recent dirs that still exist
+    seen: list[Path] = []
+    for d in RECENT_ALBUM_DIRS:
+        if d not in seen and d.exists():
+            seen.append(d)
+        if len(seen) == 5:
+            break
+
+    print(f"\n[?] Stray image at root: '{img_path.name}'")
+    print("    Which album does it belong to?\n")
+
+    if seen:
+        for i, d in enumerate(seen, 1):
+            try:
+                rel = d.relative_to(root)
+            except ValueError:
+                rel = d
+            print(f"  {i} = {rel}")
+    else:
+        print("  (No recent album destinations recorded yet)")
+
+    print(f"  c = Custom search")
+    print(f"  s = Skip")
+
+    while True:
+        raw = input("\nChoice: ").strip().lower()
+
+        if raw == "s" or raw == "":
+            return None
+
+        do_custom_search = raw == "c"
+        if do_custom_search:
+            query = input("Search albums (fuzzy): ").strip()
+            if not query:
+                continue
+
+            # Gather all album-level folders under root (depth up to 3)
+            candidates: list[Path] = []
+            try:
+                for p in root.rglob("*"):
+                    if p.is_dir() and p != root:
+                        rel_parts = p.relative_to(root).parts
+                        if len(rel_parts) <= 3:
+                            candidates.append(p)
+            except OSError:
+                pass
+
+            # Fuzzy-rank by folder name match
+            def score(folder: Path) -> float:
+                return difflib.SequenceMatcher(
+                    None,
+                    _normalize_for_comparison(query),
+                    _normalize_for_comparison(folder.name),
+                ).ratio()
+
+            ranked = sorted(candidates, key=score, reverse=True)
+            matches = [f for f in ranked if score(f) >= 0.4][:10]
+
+            if not matches:
+                print("  No matches found. Try a different query.")
+                continue
+
+            if len(matches) == 1:
+                dest = matches[0]
+                try:
+                    rel = dest.relative_to(root)
+                except ValueError:
+                    rel = dest
+                confirm = input(f"  Use '{rel}'? [Y/n]: ").strip().lower()
+                if confirm in ("", "y"):
+                    return dest
+                continue
+
+            print("\n  Multiple matches:")
+            for i, m in enumerate(matches, 1):
+                try:
+                    rel = m.relative_to(root)
+                except ValueError:
+                    rel = m
+                print(f"    {i} = {rel}")
+            pick = input("  Enter number (or Enter to cancel): ").strip()
+            if pick.isdigit():
+                idx = int(pick) - 1
+                if 0 <= idx < len(matches):
+                    return matches[idx]
+            continue
+
+        if seen and raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(seen):
+                return seen[idx]
+
+        print("  Invalid choice.")
+
+
 def process_image(
-    img_path: Path, 
-    root: Path, 
-    dry_run: bool, 
-    pending: Dict[Path, PendingEntry], 
-    approved_art: set[str], 
-    skip_art: bool
+    img_path: Path,
+    root: Path,
+    dry_run: bool,
+    pending: Dict[Path, PendingEntry],
+    approved_art: set[str],
+    skip_art: bool,
+    hierarchy: bool = False,
 ) -> None:
     if skip_art:
         pending.pop(img_path, None)
         return
-        
+
     try:
         if not img_path.exists():
             pending.pop(img_path, None)
             return
-        
+
+        # Root-level stray image handling (hierarchy mode)
+        if hierarchy and img_path.parent.resolve() == root.resolve():
+            dest_dir = prompt_root_image_destination(img_path, root)
+            if dest_dir is not None and not dry_run:
+                dest_path = dest_dir / img_path.name
+                if not dest_path.exists():
+                    shutil.move(str(img_path), str(dest_path))
+                    logging.info("Moved stray image '%s' -> '%s'", img_path.name, dest_path)
+                else:
+                    logging.info("Image '%s' already exists in '%s'; skipping.", img_path.name, dest_dir)
+            return
+
         mp3_peers = [p for p in img_path.parent.iterdir() if p.suffix.lower() == MP3_SUFFIX]
         for mp3 in mp3_peers:
             if not has_album_art(mp3):
                 meta = get_cached_metadata(mp3)
                 album_name = meta["album"] or img_path.parent.name
-                
+
                 if prompt_for_art(album_name, mp3, img_path, approved_art):
                     if not dry_run:
                         apply_external_art(mp3, img_path)
-        
+
     except OSError:
         pass
     finally:
         pending.pop(img_path, None)
 
 
-def cleanup_stale_folders(root: Path, prompted_dirs: set, dry_run: bool, ignore_list: Optional[set] = None) -> None:
+def cleanup_stale_folders(
+    root: Path,
+    prompted_dirs: set,
+    dry_run: bool,
+    ignore_list: Optional[set] = None,
+    cooldown: float = DEFAULT_CLEANUP_COOLDOWN_SECONDS,
+    folder_seen_times: Optional[Dict[Path, float]] = None,
+) -> None:
     if ignore_list is None:
         ignore_list = set()
+    if folder_seen_times is None:
+        folder_seen_times = {}
+    now = time.monotonic()
     zips_dir = archive_storage_dir(root).resolve()
     root_resolved = root.resolve()
 
@@ -1687,50 +1898,61 @@ def cleanup_stale_folders(root: Path, prompted_dirs: set, dry_run: bool, ignore_
                     pass
         else:
             has_media = any(is_audio_file(f) or is_zip_file(f) or is_image_file(f) for f in current.rglob("*"))
-            if not has_media and current not in prompted_dirs:
-                try:
-                    rel_display = str(current.relative_to(root))
-                except ValueError:
-                    rel_display = current.name
+            if has_media:
+                # Media present — reset any cooldown timer for this folder
+                folder_seen_times.pop(current, None)
+                continue
 
-                # Show top-level non-media files in this folder so the user can inspect them
+            if current in prompted_dirs:
+                continue
+
+            # Apply cooldown: only prompt after the folder has been media-free for `cooldown` seconds
+            if current not in folder_seen_times:
+                folder_seen_times[current] = now
+                continue
+            if now - folder_seen_times[current] < cooldown:
+                continue
+
+            try:
+                rel_display = str(current.relative_to(root))
+            except ValueError:
+                rel_display = current.name
+
+            # List the actual files so the user knows what they're deleting
+            try:
+                non_media_files = sorted(f.name for f in current.rglob("*") if f.is_file())
+            except OSError:
+                non_media_files = []
+
+            print(f"\nFolder '{rel_display}' contains only non-media files:")
+            for name in non_media_files:
+                print(f"  {name}")
+            print("Delete this folder entirely?")
+            ans = input("  [y/N/i (add to ignore list)]: ").strip().lower()
+
+            if ans in {"y", "yes"}:
                 try:
-                    non_media_files = sorted(
-                        [p for p in current.iterdir() if p.is_file()], key=lambda p: p.name
+                    fresh_media = any(
+                        f.is_file() and (is_audio_file(f) or is_zip_file(f) or is_image_file(f))
+                        for f in current.rglob("*")
                     )
-                except OSError:
-                    non_media_files = []
-
-                if non_media_files:
-                    print(f"\nFolder '{rel_display}' contains the following non-media files:")
-                    for i, nf in enumerate(non_media_files, 1):
-                        print(f"  {i}. {nf.name}")
-
-                ans = input(
-                    f"\nFolder '{rel_display}' only contains non-media files (e.g., info.txt, logs). "
-                    f"Delete it entirely? [y/N/i (add to ignore list)]: "
-                ).strip().lower()
-
-                if ans in {"y", "yes"}:
-                    try:
-                        fresh_media = any(
-                            f.is_file() and (is_audio_file(f) or is_zip_file(f) or is_image_file(f))
-                            for f in current.rglob("*")
+                    if fresh_media:
+                        logging.warning(
+                            "Media files appeared in '%s' while prompting — skipping deletion.", current.name
                         )
-                        if fresh_media:
-                            logging.warning("Media files detected in %s during prompt! Aborting deletion.", current.name)
-                        else:
-                            logging.info("Deleting cluttered folder: %s", current.name)
-                            if not dry_run:
-                                shutil.rmtree(current)
-                    except OSError as e:
-                        logging.error("Failed to delete folder %s: %s", current.name, e)
-                elif ans in {"i", "ignore"}:
-                    ignore_list.add(rel_key)
-                    save_ignore_list(root, ignore_list)
-                    logging.info("Added '%s' to ignore list.", rel_display)
+                        folder_seen_times.pop(current, None)
+                    else:
+                        logging.info("Deleting non-media folder: %s", current.name)
+                        if not dry_run:
+                            shutil.rmtree(current)
+                except OSError as e:
+                    logging.error("Failed to delete folder %s: %s", current.name, e)
+            elif ans in {"i", "ignore"}:
+                ignore_list.add(rel_key)
+                save_ignore_list(root, ignore_list)
+                logging.info("Added '%s' to ignore list.", rel_display)
 
-                prompted_dirs.add(current)
+            prompted_dirs.add(current)
 
 
 def manage_ignorelist_interactive(root: Path) -> None:
@@ -1759,9 +1981,10 @@ def manage_ignorelist_interactive(root: Path) -> None:
         print("No valid item numbers entered.")
 
 
-def run_once(root: Path, dry_run: bool, hierarchy: bool, skip_art: bool, skip_cleanup: bool, ignore_list: Optional[set] = None) -> None:
+def run_once(root: Path, dry_run: bool, hierarchy: bool, skip_art: bool, skip_cleanup: bool, ignore_list: Optional[set] = None, cleanup_cooldown: float = DEFAULT_CLEANUP_COOLDOWN_SECONDS) -> None:
     if ignore_list is None:
         ignore_list = set()
+    ALBUM_IGNORE_ALL.update(load_album_ignore_list(root))
     logging.info("Running in one-shot optimization mode...")
     
     archives = [p for p in iter_watch_files(root) if is_zip_file(p)]
@@ -1853,7 +2076,7 @@ def run_once(root: Path, dry_run: bool, hierarchy: bool, skip_art: bool, skip_cl
                 pass
 
     if not skip_cleanup:
-        cleanup_stale_folders(root, set(), dry_run, ignore_list)
+        cleanup_stale_folders(root, set(), dry_run, ignore_list, cooldown=cleanup_cooldown)
 
     logging.info("One-shot organization sequence completed.")
 
@@ -1873,9 +2096,10 @@ def main() -> int:
         return 0
 
     ignore_list = load_ignore_list(root)
+    ALBUM_IGNORE_ALL.update(load_album_ignore_list(root))
 
     if args.once:
-        run_once(root, args.dry_run, args.hierarchy, args.skip_art, args.skip_cleanup, ignore_list)
+        run_once(root, args.dry_run, args.hierarchy, args.skip_art, args.skip_cleanup, ignore_list, args.cleanup_cooldown)
         return 0
 
     logging.info("Watching %s", root)
@@ -1885,20 +2109,21 @@ def main() -> int:
         logging.info("Automatic Album Art detection Enabled")
     if not args.skip_cleanup:
         logging.info("Automatic Directory Cleanup Enabled")
-        
+
     logging.info("Scanning every %.2f seconds", args.interval)
 
     previous_snapshot = build_snapshot(root)
     pending_items: Dict[Path, PendingEntry] = {}
     processed_archives: Dict[Path, FileStamp] = {}
-    
+
     approved_conversions: set[str] = set()
     approved_art: set[str] = set()
     prompted_dirs: set[Path] = set()
+    folder_seen_times: Dict[Path, float] = {}
 
     if not args.skip_cleanup:
         logging.info("Performing initial directory cleanup sweep...")
-        cleanup_stale_folders(root, prompted_dirs, args.dry_run, ignore_list)
+        cleanup_stale_folders(root, prompted_dirs, args.dry_run, ignore_list, args.cleanup_cooldown, folder_seen_times)
     
     last_cleanup_time = time.monotonic()
 
@@ -2006,13 +2231,13 @@ def main() -> int:
 
         for img_path in ready_images:
             try:
-                process_image(img_path, root, args.dry_run, pending_items, approved_art, args.skip_art)
+                process_image(img_path, root, args.dry_run, pending_items, approved_art, args.skip_art, args.hierarchy)
                 did_process_something = True
             except Exception as exc:
                 logging.error("Failed to process image %s: %s", img_path, exc)
 
         if not args.skip_cleanup and (now - last_cleanup_time) >= CLEANUP_INTERVAL_SECONDS:
-            cleanup_stale_folders(root, prompted_dirs, args.dry_run, ignore_list)
+            cleanup_stale_folders(root, prompted_dirs, args.dry_run, ignore_list, args.cleanup_cooldown, folder_seen_times)
             last_cleanup_time = now
 
         previous_snapshot = current_snapshot
