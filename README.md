@@ -1,37 +1,82 @@
-# THIS PYTHON SCRIPT IS ENTIRELY VIBECODED. EXPECT BUGS
+## THIS PYTHON SCRIPT IS ENTIRELY VIBECODED. EXPECT BUGS
 
-## musicsortingthing
+# musicsortingthing
+![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 
-It's a script that sorts your songs based on the metadata. That's basically it. It realies heavily on correct metadata being placed, otherwise it won't work right. Doesn't connect to the internet at all, all done on system locally.
+A python script that heavily relies on embedded metadata for sorting your music library. 
 
-### Usage
+The script does **not** connect to the internet at all. Everything is done on system, completely locally. This also means your tags are what sort your music. So if your library isn't tagged well, then you will get bad results.
+
+Below are the tags which are emphesized in this script:
+
+- Album Name
+- Album Artist
+- Track Name
+- Track Artist
+
+## Usage
+
+**Backup your library before using this script**
 
 The script works in two different ways:
 
-1. Scan
-2. Oneshot
+1. Watch mode
+2. Oneshot mode
 
-Scanning is the default way of sorting. It checks the directory every 3 seconds for changes. If there is a new song or folder, it will sort them.
+### Watch Mode
+
+Watching a directory is the default way of sorting. It checks the directory every 3 seconds for changes.
 
 `$ ./musicsortingthing.py <directory>`
 
-Oneshot is meant to be run on folders where theres no change to be made. If you have a folder where the songs are already there but haven't been sorted yet, this is the flag that you want to run:
+### Oneshot Mode
+
+Runs the script and exits. This is useful for sorting libraries that isn't expected to change.
 
 `$ ./musicsortingthing.py --once <directory>`
 
+## Sorting Mode
+
 There are two ways in which this sorts songs:
 
-1. By album: *Album/Tracks*
-2. By artist: *Artist/Album/Discs/Tracks*
+1. By album (default)
 
-By default, the script will sort by album. However, if you want to sort by artist, you will have to pass the `--hierarchy` flag. This also works with the `--once` flag
+```
+Root/
+└── Album/
+    └── Tracks
+```
+
+2. By artist
+
+```
+Root/
+└── Artist/
+    └── Album/
+        └── Disc/
+            └── Tracks
+```
+
+### Examples
 
 `$ ./musicsortingthing.py --hierarchy <directory>`
 
 `$ ./musicsortingthing.py --hierarchy --once <directory>`
 
-If you want to see what would happen if it were to run the script normally but don't want to ruin anything, you can use the `--dry-run` flag:
+## Dry run
+
+Want to see what the script actually does without ruining your library? Try the `--dry-run` flag. 
 
 `$ ./musicsortingthing.py --dry-run <directory>`
 
-Althrough i have tested a few senarios, i can't test all of them to fix. But it should work fairly well. 
+This will print actions without executing on them. Your library will stay as is. 
+
+## Disclaimer
+
+There're a few things you should acknowledge before using this:
+
+- Metadata quality is heavily emphesized. If your songs don't have metadata at all, Things can break. Some cases like no album artist or partially matching album artists or album names have been accounted for.
+- Due to the nature of the script, it can't fetch correct metadata if the embedded metadata isn't correct. It's meant for sorting your songs, not tagging them.
+- Not every edge case has been tested for. I only have so much i can test, so if you find an issue while you use it, make an issue
+
+
