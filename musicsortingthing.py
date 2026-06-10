@@ -160,6 +160,9 @@ def load_ignore_list(root: Path) -> set:
 
 
 def save_ignore_list(root: Path, ignore_list: set) -> None:
+    if _DRY_RUN:
+        logging.info("DRY-RUN: would save folder ignore list (%d entries)", len(ignore_list))
+        return
     path = root / IGNORE_LIST_FILE
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -183,6 +186,9 @@ def load_album_ignore_list(root: Path) -> set:
 
 
 def save_album_ignore_list(root: Path, album_ignore: set) -> None:
+    if _DRY_RUN:
+        logging.info("DRY-RUN: would save album ignore list (%d entries)", len(album_ignore))
+        return
     path = root / ALBUM_IGNORE_FILE
     try:
         with open(path, "w", encoding="utf-8") as f:
