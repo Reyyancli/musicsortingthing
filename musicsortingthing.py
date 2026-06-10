@@ -548,8 +548,21 @@ def prompt_user_conflict_resolution(album: str, score_a: dict, score_b: dict) ->
             print("Please enter 1, 2, or 3.")
 
 
+_LOOKALIKE_TABLE = str.maketrans({
+    '〜': '~',   # WAVE DASH 〜 → ~
+    '～': '~',   # FULLWIDTH TILDE ～ → ~
+    '−': '-',   # MINUS SIGN − → -
+    '－': '-',   # FULLWIDTH HYPHEN-MINUS － → -
+    '‐': '-',   # HYPHEN ‐ → -
+    '—': '-',   # EM DASH — → -
+    '―': '-',   # HORIZONTAL BAR ― → -
+    '·': '.',   # MIDDLE DOT · → .
+    '・': '.',   # KATAKANA MIDDLE DOT ・ → .
+})
+
 def _normalize_for_comparison(s: str) -> str:
-    """Lowercase and strip diacritics so accented variants compare equal (e.g. è → e)."""
+    """Lowercase, strip diacritics, and fold visually-identical Unicode lookalikes."""
+    s = s.translate(_LOOKALIKE_TABLE)
     return ''.join(
         c for c in unicodedata.normalize('NFKD', s)
         if not unicodedata.combining(c)
