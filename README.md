@@ -27,6 +27,7 @@ There are two ways in which this sorts songs:
 By default, the script will sort by album. However, if you want to sort by artist, you will have to pass the `--hierarchy` flag. This also works with the `--once` flag
 
 `$ ./musicsortingthing.py --hierarchy <directory>`
+
 `$ ./musicsortingthing.py --hierarchy --once <directory>`
 
 If you want to see what would happen if it were to run the script normally but don't want to ruin anything, you can use the `--dry-run` flag:
