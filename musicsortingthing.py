@@ -109,7 +109,7 @@ DEFAULT_CLEANUP_COOLDOWN_SECONDS = 120.0
 
 # Global Caches for Performance and Context Awareness
 ALBUM_MAIN_ARTIST_CACHE: Dict[tuple[str, str], str] = {}
-ALBUM_MULTI_DISC_CACHE: Dict[str, bool] = {}
+ALBUM_MULTI_DISC_CACHE: Dict[tuple, bool] = {}  # keyed by (artist_sanitized, album_sanitized)
 METADATA_CACHE: Dict[Path, Tuple[int, dict]] = {}
 
 # Session caches for interactive prompts
@@ -125,8 +125,12 @@ RECENT_ALBUM_DIRS: deque = deque(maxlen=20)  # album folders recently written to
 SAFE_ARTIST_CONFLICTS: set = set()   # artist name pairs that would have been prompted
 SAFE_ALBUM_CONFLICTS: set = set()    # (artist, album) pairs that would have been prompted
 
-# Set once at startup from args.dry_run so inner functions don't need it threaded through
+# Set once at startup from command-line args
 _DRY_RUN: bool = False
+_REPROCESS_ORPHANS: bool = False
+
+_METADATA_CACHE_MAX = 5_000   # evict oldest entry beyond this
+_MAX_SETTLE_SECONDS = 60.0    # process a file even if still changing after this long
 
 
 class SafeAbortError(Exception):
@@ -142,6 +146,7 @@ class FileStamp:
 @dataclass
 class PendingEntry:
     first_seen: float
+    first_ever_seen: float
     stamp: FileStamp
     asked_conversion: bool = False
 
@@ -164,11 +169,15 @@ def save_ignore_list(root: Path, ignore_list: set) -> None:
         logging.info("DRY-RUN: would save folder ignore list (%d entries)", len(ignore_list))
         return
     path = root / IGNORE_LIST_FILE
+    tmp  = path.with_suffix(".tmp")
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(sorted(ignore_list), f, indent=2)
+        os.replace(tmp, path)
     except Exception as exc:
         logging.warning("Could not save ignore list: %s", exc)
+        try: tmp.unlink(missing_ok=True)
+        except OSError: pass
 
 
 def load_album_ignore_list(root: Path) -> set:
@@ -190,11 +199,15 @@ def save_album_ignore_list(root: Path, album_ignore: set) -> None:
         logging.info("DRY-RUN: would save album ignore list (%d entries)", len(album_ignore))
         return
     path = root / ALBUM_IGNORE_FILE
+    tmp  = path.with_suffix(".tmp")
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(sorted(f"{a}|{b}" for a, b in album_ignore), f, indent=2)
+        os.replace(tmp, path)
     except Exception as exc:
         logging.warning("Could not save album ignore list: %s", exc)
+        try: tmp.unlink(missing_ok=True)
+        except OSError: pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -305,6 +318,14 @@ def parse_args() -> argparse.Namespace:
             "With --once, prints a summary of all held-back tracks at the end."
         ),
     )
+    parser.add_argument(
+        "--reprocess-orphans",
+        action="store_true",
+        help=(
+            "Include files inside 'Orphan' folders when scanning. "
+            "Useful after manually correcting albumartist tags on stranded tracks."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -361,16 +382,33 @@ def is_image_file(path: Path) -> bool:
     return path.suffix.lower() in IMAGE_EXTENSIONS
 
 
+_builtin_input = input   # capture builtin before any local shadowing
+
+def _input(prompt: str = "") -> str:
+    """Wraps input(); returns '' on EOF (piped stdin, closed terminal)."""
+    try:
+        return _builtin_input(prompt)
+    except EOFError:
+        return ""
+
+
+_WINDOWS_RESERVED = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *[f"COM{i}" for i in range(1, 10)],
+    *[f"LPT{i}" for i in range(1, 10)],
+})
+
+
 def has_collision_suffix(filename: str) -> bool:
-    """Check if filename has a collision suffix like ' (1)', ' (2)', etc."""
-    return bool(re.search(r'\s+\(\d+\)\.[^.]+$', filename))
+    """Check if filename has a collision suffix like ' (1)', ' (2)', etc. (1–99 only)."""
+    return bool(re.search(r'\s+\([1-9]\d?\)\.[^.]+$', filename))
 
 
 def iter_watch_files(root: Path) -> Iterable[Path]:
     zips_root = archive_storage_dir(root).resolve()
     for path in root.rglob("*"):
         try:
-            if "Orphan" in path.parts:
+            if "Orphan" in path.parts and not _REPROCESS_ORPHANS:
                 continue
                 
             if path.is_file() and path.suffix.lower() in WATCH_EXTENSIONS:
@@ -417,7 +455,9 @@ def sanitize_folder_name(name: str) -> str:
     cleaned = name.strip()
     cleaned = re.sub(r"[\x00-\x1f\\/:*?\"<>|]", "_", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
-    return cleaned or "Unknown Album"
+    if not cleaned or cleaned.upper() in _WINDOWS_RESERVED:
+        return "Unknown Album"
+    return cleaned
 
 
 def sanitize_file_name(name: str) -> str:
@@ -534,6 +574,8 @@ def get_cached_metadata(path: Path) -> dict:
             
     meta = parse_metadata(path)
     if stamp > 0:
+        if len(METADATA_CACHE) >= _METADATA_CACHE_MAX:
+            METADATA_CACHE.pop(next(iter(METADATA_CACHE)))  # evict oldest (insertion order)
         METADATA_CACHE[path] = (stamp, meta)
     return meta
 
@@ -644,13 +686,13 @@ def prompt_user_conflict_resolution(album: str, score_a: dict, score_b: dict) ->
     print(f"  Option {clr_bold('3')}: Enter a custom Album Artist name")
 
     while True:
-        choice = input("\nWhich artist should be the Main Artist? Enter 1, 2, or 3: ").strip()
+        choice = _input("\nWhich artist should be the Main Artist? Enter 1, 2, or 3: ").strip()
         if choice == "1":
             return "A"
         if choice == "2":
             return "B"
         if choice == "3":
-            custom = input("Enter custom Album Artist name: ").strip()
+            custom = _input("Enter custom Album Artist name: ").strip()
             if custom:
                 return f"CUSTOM:{custom}"
             print("Name cannot be empty.")
@@ -671,8 +713,10 @@ _LOOKALIKE_TABLE = str.maketrans({
 })
 
 def _normalize_for_comparison(s: str) -> str:
-    """Lowercase, strip diacritics, and fold visually-identical Unicode lookalikes."""
+    """Lowercase, strip diacritics, invisible format chars, and fold Unicode lookalikes."""
     s = s.translate(_LOOKALIKE_TABLE)
+    # Strip Cf (format) characters: ZWJ, RLM, soft-hyphen, variation selectors, etc.
+    s = ''.join(c for c in s if unicodedata.category(c) != 'Cf')
     return ''.join(
         c for c in unicodedata.normalize('NFKD', s)
         if not unicodedata.combining(c)
@@ -799,13 +843,13 @@ def prompt_artist_merge(album: str, existing_artist: str, new_artist: str, root:
     print(f"  {clr_gray('Enter')} = Skip for now")
 
     while True:
-        choice = input("Your choice: ").strip()
+        choice = _input("Your choice: ").strip()
         if choice == "1":
             return existing_artist
         if choice == "2":
             return new_artist
         if choice == "3":
-            custom = input("Enter custom artist name: ").strip()
+            custom = _input("Enter custom artist name: ").strip()
             if custom:
                 return custom
             print("Name cannot be empty.")
@@ -852,13 +896,13 @@ def prompt_album_merge(new_album: str, existing_album: str, artist: str, search_
     print(f"  {clr_gray('Enter')} = Skip for now")
 
     while True:
-        choice = input("Your choice: ").strip()
+        choice = _input("Your choice: ").strip()
         if choice == "1":
             return existing_album
         if choice == "2":
             return None
         if choice == "3":
-            custom = input("Enter custom album name: ").strip()
+            custom = _input("Enter custom album name: ").strip()
             if custom:
                 return f"CUSTOM:{custom}"
             print("Name cannot be empty.")
@@ -954,7 +998,7 @@ def resolve_main_artist(
     if current_artist == "Unknown Artist":
         unknown_key = (album, "UNKNOWN")
         if unknown_key not in ALBUM_MAIN_ARTIST_CACHE:
-            user_artist = input(
+            user_artist = _input(
                 f"\nAlbum '{album}' has no artist information.\n"
                 f"Enter artist name for this album: "
             ).strip()
@@ -1314,7 +1358,7 @@ def ensure_albumartist(path: Path, meta: dict) -> dict:
     print(f"  Enter = Skip")
 
     while True:
-        value = input("Album artist (name / 'a' / Enter to skip): ").strip()
+        value = _input("Album artist (name / 'a' / Enter to skip): ").strip()
         if not value:
             MISSING_ALBUMARTIST_ASKED.add(path_key)
             return meta
@@ -1328,7 +1372,7 @@ def ensure_albumartist(path: Path, meta: dict) -> dict:
 
     apply_all = False
     if album:
-        ans = input(
+        ans = _input(
             f"Apply '{value}' to all remaining tracks in '{album}' without asking again? [y/N]: "
         ).strip().lower()
         if ans in ("y", "yes"):
@@ -1411,7 +1455,8 @@ def get_destination_info(
     dest_dir = root / main_artist_sanitized / album_sanitized
 
     # Unified Multi-Disc Determination Logic
-    multi_disc = ALBUM_MULTI_DISC_CACHE.get(album, False)
+    _mdc_key = (main_artist_sanitized, album_sanitized)
+    multi_disc = ALBUM_MULTI_DISC_CACHE.get(_mdc_key, False)
     if not multi_disc:
         # Fallback to check if a Disc > 1 folder exists locally
         if dest_dir.exists():
@@ -1419,15 +1464,14 @@ def get_destination_info(
                 for child in dest_dir.iterdir():
                     if child.is_dir() and re.match(r'^Disc\s+([2-9]|\d{2,})$', child.name, re.IGNORECASE):
                         multi_disc = True
-                        ALBUM_MULTI_DISC_CACHE[album] = True
+                        ALBUM_MULTI_DISC_CACHE[_mdc_key] = True
                         break
             except OSError:
                 pass
 
     if multi_disc:
-        d_num_safe = meta.get("disc_num")
-        if not (d_num_safe and d_num_safe.isdigit()):
-            d_num_safe = "1"
+        d_num_safe = (meta.get("disc_num") or "").strip()
+        d_num_safe = str(int(d_num_safe)) if d_num_safe.isdigit() else "1"
         dest_dir = dest_dir / sanitize_folder_name(f"Disc {d_num_safe}")
 
     raw_title = meta["title"] or path.stem
@@ -1529,7 +1573,7 @@ def prompt_for_conversion(album: str, path: Path, approved_conversions: set[str]
         return True
 
     while True:
-        answer = input(
+        answer = _input(
             f"Convert non-MP3 file to MP3?\nAlbum: {album}\nFile:  {path.name}\nContinue [y/N/a (all for this album)]: "
         ).strip().lower()
         if answer in {"y", "yes"}:
@@ -1547,7 +1591,7 @@ def prompt_for_art(album: str, mp3_path: Path, img_path: Path, approved_art: set
         return True
 
     while True:
-        ans = input(
+        ans = _input(
             f"\nApply album art to missing track?\nAlbum: {album}\nTrack: {mp3_path.name}\nImage: {img_path.name}\nContinue [y/N/a (all for this album)]: "
         ).strip().lower()
         if ans in {'y', 'yes'}:
@@ -1615,6 +1659,12 @@ def convert_to_mp3(source: Path, destination_dir: Path, target_stem: str, root: 
 
         if art_info:
             inject_album_art(final_output, art_info[0], art_info[1])
+
+        if final_output.stat().st_size < 1024:
+            logging.error(
+                "Converted file appears corrupt (<1 KB): %s — source kept", final_output.name
+            )
+            return final_output
 
         source.unlink()
         logging.info("Converted %s -> %s and retained album art", source.name, final_output.name)
@@ -1822,7 +1872,14 @@ def process_track(
 
     entry = pending_tracks.get(path)
     if entry is None or entry.stamp != current_stamp:
-        pending_tracks[path] = PendingEntry(first_seen=time.monotonic(), stamp=current_stamp)
+        now_ts = time.monotonic()
+        first_ever = entry.first_ever_seen if entry is not None else now_ts
+        pending_tracks[path] = PendingEntry(
+            first_seen=now_ts,
+            first_ever_seen=first_ever,
+            stamp=current_stamp,
+            asked_conversion=entry.asked_conversion if entry is not None else False,
+        )
         return
 
     meta = get_cached_metadata(path)
@@ -1857,7 +1914,7 @@ def process_track(
             final_mp3 = path
     else:
         if no_convert:
-            logging.debug("Skipping non-MP3 file (--no-convert): %s", path.name)
+            logging.warning("Skipping non-MP3 file (--no-convert): %s", path.name)
             pending_tracks.pop(path, None)
             return
 
@@ -1936,28 +1993,28 @@ def prompt_root_image_destination(img_path: Path, root: Path) -> Optional[Path]:
     print(f"  c = Custom search")
     print(f"  s = Skip")
 
+    # Build candidate folder list once — avoids repeated rglob on every 'c' press
+    candidates: list[Path] = []
+    try:
+        for p in root.rglob("*"):
+            if p.is_dir() and p != root:
+                rel_parts = p.relative_to(root).parts
+                if len(rel_parts) <= 3:
+                    candidates.append(p)
+    except OSError:
+        pass
+
     while True:
-        raw = input("\nChoice: ").strip().lower()
+        raw = _input("\nChoice: ").strip().lower()
 
         if raw == "s" or raw == "":
             return None
 
         do_custom_search = raw == "c"
         if do_custom_search:
-            query = input("Search albums (fuzzy): ").strip()
+            query = _input("Search albums (fuzzy): ").strip()
             if not query:
                 continue
-
-            # Gather all album-level folders under root (depth up to 3)
-            candidates: list[Path] = []
-            try:
-                for p in root.rglob("*"):
-                    if p.is_dir() and p != root:
-                        rel_parts = p.relative_to(root).parts
-                        if len(rel_parts) <= 3:
-                            candidates.append(p)
-            except OSError:
-                pass
 
             # Fuzzy-rank by folder name match — score each candidate once
             query_norm = _normalize_for_comparison(query)
@@ -1978,7 +2035,7 @@ def prompt_root_image_destination(img_path: Path, root: Path) -> Optional[Path]:
                     rel = dest.relative_to(root)
                 except ValueError:
                     rel = dest
-                confirm = input(f"  Use '{rel}'? [Y/n]: ").strip().lower()
+                confirm = _input(f"  Use '{rel}'? [Y/n]: ").strip().lower()
                 if confirm in ("", "y"):
                     return dest
                 continue
@@ -1990,7 +2047,7 @@ def prompt_root_image_destination(img_path: Path, root: Path) -> Optional[Path]:
                 except ValueError:
                     rel = m
                 print(f"    {i} = {rel}")
-            pick = input("  Enter number (or Enter to cancel): ").strip()
+            pick = _input("  Enter number (or Enter to cancel): ").strip()
             if pick.isdigit():
                 idx = int(pick) - 1
                 if 0 <= idx < len(matches):
@@ -2130,7 +2187,7 @@ def cleanup_stale_folders(
             for name in non_media_files:
                 print(f"  {name}")
             print("Delete this folder entirely?")
-            ans = input("  [y/N/i (add to ignore list)]: ").strip().lower()
+            ans = _input("  [y/N/i (add to ignore list)]: ").strip().lower()
 
             if ans in {"y", "yes"}:
                 try:
@@ -2167,7 +2224,7 @@ def manage_ignorelist_interactive(root: Path) -> None:
     print("\n=== Deletion Ignore List ===")
     for i, item in enumerate(items, 1):
         print(f"  {i}. {item}")
-    raw = input("\nEnter item numbers to remove (comma-separated), or press Enter to quit: ").strip()
+    raw = _input("\nEnter item numbers to remove (comma-separated), or press Enter to quit: ").strip()
     if not raw:
         return
     try:
@@ -2202,7 +2259,7 @@ def manage_album_ignorelist_interactive(root: Path) -> None:
         print("  a           = add a new entry manually")
         print("  Enter       = save and quit")
 
-        raw = input("\nChoice: ").strip()
+        raw = _input("\nChoice: ").strip()
 
         if not raw:
             break
@@ -2226,8 +2283,8 @@ def manage_album_ignorelist_interactive(root: Path) -> None:
                 print("No valid item numbers.")
 
         elif raw.lower() == "a":
-            artist_in = input("  Artist (leave blank for any): ").strip()
-            album_in = input("  Album name: ").strip()
+            artist_in = _input("  Artist (leave blank for any): ").strip()
+            album_in = _input("  Album name: ").strip()
             if not album_in:
                 print("  Album name cannot be empty.")
                 continue
@@ -2254,11 +2311,31 @@ def _update_multidisc_cache(tracks: Iterable[Path]) -> None:
     for path in tracks:
         meta = get_cached_metadata(path)
         album = meta.get("album")
-        if album and not ALBUM_MULTI_DISC_CACHE.get(album):
-            d_num = meta.get("disc_num")
-            d_tot = meta.get("disc_total")
-            if (d_tot and d_tot.isdigit() and int(d_tot) > 1) or (d_num and d_num.isdigit() and int(d_num) > 1):
-                ALBUM_MULTI_DISC_CACHE[album] = True
+        if not album:
+            continue
+        artist = sanitize_folder_name(meta.get("albumartist") or meta.get("artist") or "")
+        key = (artist, sanitize_folder_name(album))
+        if not ALBUM_MULTI_DISC_CACHE.get(key):
+            d_num = (meta.get("disc_num") or "").strip()
+            d_tot = (meta.get("disc_total") or "").strip()
+            if (d_tot.isdigit() and int(d_tot) > 1) or (d_num.isdigit() and int(d_num) > 1):
+                ALBUM_MULTI_DISC_CACHE[key] = True
+
+
+def _print_safe_conflicts() -> None:
+    """Print the safe-mode conflict summary (used by both --once and watch Ctrl+C exit)."""
+    if not (SAFE_ARTIST_CONFLICTS or SAFE_ALBUM_CONFLICTS):
+        return
+    print(clr_yellow("\n[!] Safe-mode held back the following conflicts (not moved):"))
+    if SAFE_ARTIST_CONFLICTS:
+        print(clr_bold("\n  Artist conflicts (--no-partial-artist):"))
+        for i, (a, b) in enumerate(sorted(SAFE_ARTIST_CONFLICTS), 1):
+            print(f"    {i}. {clr_red(a)}  ~  {clr_green(b)}")
+    if SAFE_ALBUM_CONFLICTS:
+        print(clr_bold("\n  Album conflicts (--no-partial-album):"))
+        for i, (artist, album_new, album_existing) in enumerate(sorted(SAFE_ALBUM_CONFLICTS), 1):
+            artist_label = f"{clr_cyan(artist)} / " if artist else ""
+            print(f"    {i}. {artist_label}{clr_green(album_new)}  ~  {clr_red(album_existing)}")
 
 
 def run_once(
@@ -2374,17 +2451,8 @@ def run_once(
 
     logging.info("One-shot organization sequence completed.")
 
-    if safe and (SAFE_ARTIST_CONFLICTS or SAFE_ALBUM_CONFLICTS):
-        print(clr_yellow("\n[!] Safe-mode held back the following conflicts (not moved):"))
-        if SAFE_ARTIST_CONFLICTS:
-            print(clr_bold("\n  Artist conflicts (--no-partial-artist):"))
-            for i, (a, b) in enumerate(sorted(SAFE_ARTIST_CONFLICTS), 1):
-                print(f"    {i}. {clr_red(a)}  ~  {clr_green(b)}")
-        if SAFE_ALBUM_CONFLICTS:
-            print(clr_bold("\n  Album conflicts (--no-partial-album):"))
-            for i, (artist, album_new, album_existing) in enumerate(sorted(SAFE_ALBUM_CONFLICTS), 1):
-                artist_label = f"{clr_cyan(artist)} / " if artist else ""
-                print(f"    {i}. {artist_label}{clr_green(album_new)}  ~  {clr_red(album_existing)}")
+    if safe:
+        _print_safe_conflicts()
 
 
 def main() -> int:
@@ -2397,10 +2465,13 @@ def main() -> int:
         logging.error(str(exc))
         return 1
 
-    global _DRY_RUN
+    global _DRY_RUN, _REPROCESS_ORPHANS
     _DRY_RUN = args.dry_run
+    _REPROCESS_ORPHANS = args.reprocess_orphans
     if _DRY_RUN:
         logging.info("DRY-RUN mode: no files will be moved, created, or modified.")
+    if _REPROCESS_ORPHANS:
+        logging.info("Orphan folders will be re-scanned (--reprocess-orphans).")
 
     if args.manage_ignorelist:
         manage_ignorelist_interactive(root)
@@ -2450,118 +2521,152 @@ def main() -> int:
     
     last_cleanup_time = time.monotonic()
 
-    while True:
-        try:
-            current_snapshot = build_snapshot(root)
-        except Exception as exc:
-            logging.error("Scan failed: %s", exc)
-            time.sleep(args.interval)
-            continue
-
-        added, removed, modified = scan_for_changes(previous_snapshot, current_snapshot)
-        now = time.monotonic()
-
-        for path in added + modified:
-            if is_zip_file(path):
-                processed_archives.pop(path, None)
-            elif is_audio_file(path) or is_image_file(path):
-                pending_items[path] = PendingEntry(first_seen=now, stamp=current_snapshot[path])
-
-        for path in removed:
-            pending_items.pop(path, None)
-            processed_archives.pop(path, None)
-
-        for path in list(pending_items.keys()):
-            if path not in current_snapshot:
-                pending_items.pop(path, None)
+    try:
+        while True:
+            try:
+                current_snapshot = build_snapshot(root)
+            except Exception as exc:
+                logging.error("Scan failed: %s", exc)
+                time.sleep(args.interval)
                 continue
-            current_stamp = current_snapshot[path]
-            entry = pending_items[path]
-            if entry.stamp != current_stamp:
-                pending_items[path] = PendingEntry(first_seen=now, stamp=current_stamp)
 
-        if added or removed or modified:
-            for path in added:
-                logging.info("Added: %s", path)
-            for path in modified:
-                logging.info("Modified: %s", path)
+            added, removed, modified = scan_for_changes(previous_snapshot, current_snapshot)
+            now = time.monotonic()
+
+            for path in added + modified:
+                if is_zip_file(path):
+                    processed_archives.pop(path, None)
+                elif is_audio_file(path) or is_image_file(path):
+                    old = pending_items.get(path)
+                    pending_items[path] = PendingEntry(
+                        first_seen=now,
+                        first_ever_seen=old.first_ever_seen if old else now,
+                        stamp=current_snapshot[path],
+                        asked_conversion=old.asked_conversion if old else False,
+                    )
+
             for path in removed:
-                logging.info("Removed: %s", path)
+                pending_items.pop(path, None)
+                processed_archives.pop(path, None)
 
-        did_process_something = False
+            for path in list(pending_items.keys()):
+                if path not in current_snapshot:
+                    pending_items.pop(path, None)
+                    continue
+                current_stamp = current_snapshot[path]
+                entry = pending_items[path]
+                if entry.stamp != current_stamp:
+                    if (now - entry.first_ever_seen) >= _MAX_SETTLE_SECONDS:
+                        # Hard timeout: stamp keeps changing but file has waited long enough.
+                        # Preserve first_seen so it passes the settle check next cycle.
+                        logging.warning(
+                            "'%s' has been unstable for %.0fs — will process next cycle.",
+                            path.name, now - entry.first_ever_seen,
+                        )
+                        pending_items[path] = PendingEntry(
+                            first_seen=entry.first_seen,
+                            first_ever_seen=entry.first_ever_seen,
+                            stamp=current_stamp,
+                            asked_conversion=entry.asked_conversion,
+                        )
+                    else:
+                        pending_items[path] = PendingEntry(
+                            first_seen=now,
+                            first_ever_seen=entry.first_ever_seen,
+                            stamp=current_stamp,
+                            asked_conversion=entry.asked_conversion,
+                        )
 
-        for archive_path in list(current_snapshot.keys()):
-            if not is_zip_file(archive_path):
-                continue
-            try:
-                stat_result = archive_path.stat()
-            except OSError:
-                continue
-            stamp = FileStamp(size=stat_result.st_size, mtime_ns=stat_result.st_mtime_ns)
-            if processed_archives.get(archive_path) == stamp:
-                continue
+            if added or removed or modified:
+                for path in added:
+                    logging.info("Added: %s", path)
+                for path in modified:
+                    logging.info("Modified: %s", path)
+                for path in removed:
+                    logging.info("Removed: %s", path)
 
-            archive_pending = pending_items.get(archive_path)
-            if archive_pending is None:
-                pending_items[archive_path] = PendingEntry(first_seen=now, stamp=stamp)
-                continue
-            if archive_pending.stamp != stamp:
-                pending_items[archive_path] = PendingEntry(first_seen=now, stamp=stamp)
-                continue
-            if (now - archive_pending.first_seen) < args.settle:
-                continue
+            for archive_path in list(current_snapshot.keys()):
+                if not is_zip_file(archive_path):
+                    continue
+                try:
+                    stat_result = archive_path.stat()
+                except OSError:
+                    continue
+                stamp = FileStamp(size=stat_result.st_size, mtime_ns=stat_result.st_mtime_ns)
+                if processed_archives.get(archive_path) == stamp:
+                    continue
 
-            try:
-                process_archive(archive_path, root, args.dry_run, processed_archives, args.hierarchy)
-                did_process_something = True
-            except Exception as exc:
-                logging.error("Failed to process archive %s: %s", archive_path, exc)
+                archive_pending = pending_items.get(archive_path)
+                if archive_pending is None:
+                    pending_items[archive_path] = PendingEntry(
+                        first_seen=now, first_ever_seen=now, stamp=stamp
+                    )
+                    continue
+                if archive_pending.stamp != stamp:
+                    pending_items[archive_path] = PendingEntry(
+                        first_seen=now,
+                        first_ever_seen=archive_pending.first_ever_seen,
+                        stamp=stamp,
+                        asked_conversion=archive_pending.asked_conversion,
+                    )
+                    continue
+                if (now - archive_pending.first_seen) < args.settle:
+                    continue
 
-        ready_tracks = [
-            path for path, entry in pending_items.items()
-            if is_audio_file(path) and path in current_snapshot and (now - entry.first_seen) >= args.settle
-        ]
-        ready_images = [
-            path for path, entry in pending_items.items()
-            if is_image_file(path) and path in current_snapshot and (now - entry.first_seen) >= args.settle
-        ]
+                try:
+                    process_archive(archive_path, root, args.dry_run, processed_archives, args.hierarchy)
+                except Exception as exc:
+                    logging.error("Failed to process archive %s: %s", archive_path, exc)
 
-        if ready_tracks:
-            _update_multidisc_cache(ready_tracks)
+            ready_tracks = [
+                path for path, entry in pending_items.items()
+                if is_audio_file(path) and path in current_snapshot and (now - entry.first_seen) >= args.settle
+            ]
+            ready_images = [
+                path for path, entry in pending_items.items()
+                if is_image_file(path) and path in current_snapshot and (now - entry.first_seen) >= args.settle
+            ]
 
-        for track_path in ready_tracks:
-            try:
-                process_track(
-                    track_path,
-                    root,
-                    args.dry_run,
-                    pending_items,
-                    approved_conversions,
-                    approved_art,
-                    args.hierarchy,
-                    args.skip_art,
-                    no_convert=args.no_convert,
-                    no_partial_album=args.no_partial_album,
-                    no_partial_artist=args.no_partial_artist,
-                    safe=args.safe,
-                )
-                did_process_something = True
-            except Exception as exc:
-                logging.error("Failed to process track %s: %s", track_path, exc)
+            if ready_tracks:
+                _update_multidisc_cache(ready_tracks)
 
-        for img_path in ready_images:
-            try:
-                process_image(img_path, root, args.dry_run, pending_items, approved_art, args.skip_art, args.hierarchy)
-                did_process_something = True
-            except Exception as exc:
-                logging.error("Failed to process image %s: %s", img_path, exc)
+            for track_path in ready_tracks:
+                try:
+                    process_track(
+                        track_path,
+                        root,
+                        args.dry_run,
+                        pending_items,
+                        approved_conversions,
+                        approved_art,
+                        args.hierarchy,
+                        args.skip_art,
+                        no_convert=args.no_convert,
+                        no_partial_album=args.no_partial_album,
+                        no_partial_artist=args.no_partial_artist,
+                        safe=args.safe,
+                    )
+                except Exception as exc:
+                    logging.error("Failed to process track %s: %s", track_path, exc)
 
-        if not args.skip_cleanup and (now - last_cleanup_time) >= CLEANUP_INTERVAL_SECONDS:
-            cleanup_stale_folders(root, prompted_dirs, args.dry_run, ignore_list, args.cleanup_cooldown, folder_seen_times)
-            last_cleanup_time = now
+            for img_path in ready_images:
+                try:
+                    process_image(img_path, root, args.dry_run, pending_items, approved_art, args.skip_art, args.hierarchy)
+                except Exception as exc:
+                    logging.error("Failed to process image %s: %s", img_path, exc)
 
-        previous_snapshot = current_snapshot
-        time.sleep(args.interval)
+            if not args.skip_cleanup and (now - last_cleanup_time) >= CLEANUP_INTERVAL_SECONDS:
+                cleanup_stale_folders(root, prompted_dirs, args.dry_run, ignore_list, args.cleanup_cooldown, folder_seen_times)
+                last_cleanup_time = now
+
+            previous_snapshot = current_snapshot
+            time.sleep(args.interval)
+
+    except KeyboardInterrupt:
+        logging.info("Watcher stopped.")
+        if args.safe:
+            _print_safe_conflicts()
+        return 0
 
 
 if __name__ == "__main__":
