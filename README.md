@@ -14,6 +14,14 @@ Below are the tags which are emphesized in this script:
 - Track Name
 - Track Artist
 
+## Installation
+
+You don't really have to install to use the script but I included it anyway to make it easier.
+
+1. Download the latest release zip from releases and unzip it.
+
+2. For unix based systems, run `installer.py` in a shell. If you're on windows, just double click the installer.
+
 ## Usage
 
 **Backup your library before using this script**
