@@ -121,6 +121,17 @@ ALBUM_MERGE_DECISIONS: Dict[tuple, str] = {}
 ALBUM_IGNORE_ALL: set = set()  # (artist_sanitized, album_sanitized) — skip all partial matches
 RECENT_ALBUM_DIRS: deque = deque(maxlen=20)  # album folders recently written to, newest first
 
+# Safe-mode conflict collectors — populated when --safe is active and a check is disabled
+SAFE_ARTIST_CONFLICTS: set = set()   # artist name pairs that would have been prompted
+SAFE_ALBUM_CONFLICTS: set = set()    # (artist, album) pairs that would have been prompted
+
+# Set once at startup from args.dry_run so inner functions don't need it threaded through
+_DRY_RUN: bool = False
+
+
+class SafeAbortError(Exception):
+    """Raised in --safe mode when a partial-match check is disabled and a conflict is detected."""
+
 
 @dataclass(frozen=True)
 class FileStamp:
@@ -252,6 +263,40 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Seconds a non-media folder must remain unchanged before a deletion prompt is shown. "
             f"Prevents prompts while new files are still being added (default: {DEFAULT_CLEANUP_COOLDOWN_SECONDS})"
+        ),
+    )
+    parser.add_argument(
+        "--no-convert",
+        action="store_true",
+        help="Skip MP3 conversion entirely; non-MP3 audio files are left in place.",
+    )
+    parser.add_argument(
+        "--no-partial-album",
+        action="store_true",
+        help="Disable partial album name matching (never prompt to merge similar album names).",
+    )
+    parser.add_argument(
+        "--no-partial-artist",
+        action="store_true",
+        help="Disable partial album-artist matching (never prompt to merge similar artist names).",
+    )
+    parser.add_argument(
+        "--no-folder-ignorelist",
+        action="store_true",
+        help="Ignore the persisted folder-deletion ignore list for this run.",
+    )
+    parser.add_argument(
+        "--no-album-ignorelist",
+        action="store_true",
+        help="Ignore the persisted album partial-match ignore list for this run.",
+    )
+    parser.add_argument(
+        "--safe",
+        action="store_true",
+        help=(
+            "When combined with --no-partial-album or --no-partial-artist, abort moving any track "
+            "that would have triggered a prompt instead of silently skipping it. "
+            "With --once, prints a summary of all held-back tracks at the end."
         ),
     )
     return parser.parse_args()
@@ -826,6 +871,8 @@ def _resolve_album_partial_match(
     album_sanitized: str,
     album_raw: str,
     track_path: Path,
+    no_partial_album: bool = False,
+    safe: bool = False,
 ) -> Optional[str]:
     ignore_key = (artist_sanitized or "", album_sanitized)
     if ignore_key in ALBUM_IGNORE_ALL:
@@ -844,6 +891,20 @@ def _resolve_album_partial_match(
         if pair_key in ALBUM_PARTIAL_MATCH_ASKED:
             continue
         ALBUM_PARTIAL_MATCH_ASKED.add(pair_key)
+
+        if no_partial_album:
+            conflict_key = (artist_sanitized or "", album_sanitized, existing_album)
+            if safe:
+                SAFE_ALBUM_CONFLICTS.add(conflict_key)
+                raise SafeAbortError(
+                    f"Album '{album_raw}' conflicts with existing '{existing_album}' "
+                    f"(--no-partial-album + --safe: aborting move)"
+                )
+            logging.debug(
+                "Skipping partial album match prompt: '%s' ~ '%s' (--no-partial-album)",
+                album_raw, existing_album,
+            )
+            continue
 
         decision = prompt_album_merge(album_raw, existing_album, artist_sanitized or "", search_dir)
 
@@ -872,7 +933,13 @@ def _resolve_album_partial_match(
     return None
 
 
-def resolve_main_artist(meta: dict, root: Path, current_track: Path) -> str:
+def resolve_main_artist(
+    meta: dict,
+    root: Path,
+    current_track: Path,
+    no_partial_artist: bool = False,
+    safe: bool = False,
+) -> str:
     album = meta["album"]
     if not album:
         return sanitize_folder_name(meta["albumartist"] or meta["artist"] or "Unknown Artist")
@@ -956,6 +1023,15 @@ def resolve_main_artist(meta: dict, root: Path, current_track: Path) -> str:
             if pair_key in ARTIST_PARTIAL_MATCH_ASKED:
                 continue
             ARTIST_PARTIAL_MATCH_ASKED.add(pair_key)
+            if no_partial_artist:
+                if safe:
+                    SAFE_ARTIST_CONFLICTS.add(pair_key)
+                    raise SafeAbortError(
+                        f"Artist '{best_artist}' conflicts with existing '{other_artist}' "
+                        f"(--no-partial-artist + --safe: aborting move)"
+                    )
+                logging.debug("Skipping partial artist match: '%s' ~ '%s' (--no-partial-artist)", best_artist, other_artist)
+                continue
             decision = prompt_artist_merge(album, other_artist, best_artist, root)
             if decision:
                 unified = sanitize_folder_name(decision)
@@ -1005,6 +1081,15 @@ def resolve_main_artist(meta: dict, root: Path, current_track: Path) -> str:
         if not strings_partially_match(candidate_artist, best_artist):
             continue
         ARTIST_PARTIAL_MATCH_ASKED.add(pair_key)
+        if no_partial_artist:
+            if safe:
+                SAFE_ARTIST_CONFLICTS.add(pair_key)
+                raise SafeAbortError(
+                    f"Artist '{best_artist}' conflicts with candidate '{candidate_artist}' "
+                    f"(--no-partial-artist + --safe: aborting move)"
+                )
+            logging.debug("Skipping partial artist match: '%s' ~ '%s' (--no-partial-artist)", best_artist, candidate_artist)
+            continue
         decision = prompt_artist_merge(album, candidate_artist, best_artist, root)
         if decision:
             unified = sanitize_folder_name(decision)
@@ -1027,6 +1112,15 @@ def resolve_main_artist(meta: dict, root: Path, current_track: Path) -> str:
         if pair_key in ARTIST_PARTIAL_MATCH_ASKED:
             continue
         ARTIST_PARTIAL_MATCH_ASKED.add(pair_key)
+        if no_partial_artist:
+            if safe:
+                SAFE_ARTIST_CONFLICTS.add(pair_key)
+                raise SafeAbortError(
+                    f"Artist '{best_artist}' conflicts with existing folder '{other_artist}' "
+                    f"(--no-partial-artist + --safe: aborting move)"
+                )
+            logging.debug("Skipping partial artist match: '%s' ~ '%s' (--no-partial-artist)", best_artist, other_artist)
+            continue
         decision = prompt_artist_merge(album, other_artist, best_artist, root)
         if decision:
             unified = sanitize_folder_name(decision)
@@ -1101,6 +1195,9 @@ def has_album_art(mp3_path: Path) -> bool:
 
 
 def write_albumartist_tag(path: Path, albumartist: str) -> None:
+    if _DRY_RUN:
+        logging.info("DRY-RUN: would set albumartist='%s' on %s", albumartist, path.name)
+        return
     try:
         # Get original mtime before modification
         try:
@@ -1110,7 +1207,7 @@ def write_albumartist_tag(path: Path, albumartist: str) -> None:
         except OSError:
             mtime_sec = None
             atime_sec = None
-            
+
         audio = MutagenFile(path, easy=True)
         if audio is None:
             return
@@ -1150,6 +1247,9 @@ def write_albumartist_for_tracks(tracks: Iterable[Path], albumartist: str) -> No
 
 
 def write_album_tag(path: Path, album: str) -> None:
+    if _DRY_RUN:
+        logging.info("DRY-RUN: would set album='%s' on %s", album, path.name)
+        return
     try:
         try:
             stat_before = path.stat()
@@ -1258,17 +1358,25 @@ def apply_external_art(mp3_path: Path, img_path: Path) -> None:
         logging.error("Failed to apply artwork to %s: %s", mp3_path.name, e)
 
 
-def get_destination_info(root: Path, path: Path, meta: dict, hierarchy: bool) -> Tuple[Path, str, bool]:
+def get_destination_info(
+    root: Path,
+    path: Path,
+    meta: dict,
+    hierarchy: bool,
+    no_partial_album: bool = False,
+    no_partial_artist: bool = False,
+    safe: bool = False,
+) -> Tuple[Path, str, bool]:
     album = meta["album"] or "Unknown Album"
     album_sanitized = sanitize_folder_name(album)
 
     if not hierarchy:
-        canonical_album = _resolve_album_partial_match(root, None, album_sanitized, album, path)
+        canonical_album = _resolve_album_partial_match(root, None, album_sanitized, album, path, no_partial_album, safe)
         if canonical_album is not None:
             album_sanitized = canonical_album
         return root / album_sanitized, path.stem, False
 
-    main_artist_sanitized = resolve_main_artist(meta, root, path)
+    main_artist_sanitized = resolve_main_artist(meta, root, path, no_partial_artist, safe)
 
     # If resolve_main_artist returns None (e.g., single-match with metadata mismatch),
     # fall back to using track's own artist metadata
@@ -1296,7 +1404,7 @@ def get_destination_info(root: Path, path: Path, meta: dict, hierarchy: bool) ->
         return dest_dir, target_stem, True
 
     # Check for partial album name match under the artist folder
-    canonical_album = _resolve_album_partial_match(root, main_artist_sanitized, album_sanitized, album, path)
+    canonical_album = _resolve_album_partial_match(root, main_artist_sanitized, album_sanitized, album, path, no_partial_album, safe)
     if canonical_album is not None:
         album_sanitized = canonical_album
 
@@ -1371,7 +1479,8 @@ def move_associated_images(source_dir: Path, dest_dir: Path, dry_run: bool) -> N
 
 
 def move_file(path: Path, destination_dir: Path, target_stem: str, root: Path, dry_run: bool) -> Path:
-    destination_dir.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        destination_dir.mkdir(parents=True, exist_ok=True)
 
     canonical = destination_dir / f"{target_stem}{path.suffix}"
 
@@ -1450,17 +1559,18 @@ def prompt_for_art(album: str, mp3_path: Path, img_path: Path, approved_art: set
 
 
 def convert_to_mp3(source: Path, destination_dir: Path, target_stem: str, root: Path, dry_run: bool, meta: dict) -> Path:
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    final_output = unique_destination_path(destination_dir, target_stem, MP3_SUFFIX)
+    final_output = destination_dir / f"{target_stem}{MP3_SUFFIX}"
 
     if not within_root(final_output, root):
         raise RuntimeError(f"Refusing to write outside root: {final_output}")
 
-    art_info = extract_album_art(source)
-
     if dry_run:
-        logging.info("DRY-RUN: convert %s -> %s", source, final_output)
+        logging.info("DRY-RUN: would convert %s -> %s", source.name, final_output)
         return final_output
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    final_output = unique_destination_path(destination_dir, target_stem, MP3_SUFFIX)
+    art_info = extract_album_art(source)
 
     if not ffmpeg_available():
         raise RuntimeError("ffmpeg is not installed or is not available on PATH")
@@ -1564,15 +1674,17 @@ def archive_extraction_dir(root: Path, archive_stem: str) -> Path:
 
 def move_archive_into_zips(archive: Path, root: Path, dry_run: bool) -> Path:
     zips_root = archive_storage_dir(root)
-    zips_root.mkdir(parents=True, exist_ok=True)
-    destination = unique_destination_path(zips_root, archive.stem, archive.suffix)
+    destination = zips_root / archive.name
 
     if archive.resolve() == destination.resolve():
         return destination
 
     if dry_run:
-        logging.info("DRY-RUN: move archive %s -> %s", archive, destination)
+        logging.info("DRY-RUN: would move archive %s -> %s", archive.name, destination)
         return destination
+
+    zips_root.mkdir(parents=True, exist_ok=True)
+    destination = unique_destination_path(zips_root, archive.stem, archive.suffix)
 
     shutil.move(str(archive), str(destination))
     logging.info("Moved archive %s -> %s", archive, destination)
@@ -1690,6 +1802,10 @@ def process_track(
     approved_art: set[str],
     hierarchy: bool,
     skip_art: bool,
+    no_convert: bool = False,
+    no_partial_album: bool = False,
+    no_partial_artist: bool = False,
+    safe: bool = False,
 ) -> None:
     try:
         stat_result = path.stat()
@@ -1714,7 +1830,14 @@ def process_track(
         return
 
     meta = ensure_albumartist(path, meta)
-    destination_dir, target_stem, is_orphan = get_destination_info(root, path, meta, hierarchy)
+    try:
+        destination_dir, target_stem, is_orphan = get_destination_info(
+            root, path, meta, hierarchy, no_partial_album, no_partial_artist, safe
+        )
+    except SafeAbortError as exc:
+        logging.warning("Safe-abort: held back '%s' — %s", path.name, exc)
+        pending_tracks.pop(path, None)
+        return
 
     if not within_root(destination_dir, root):
         logging.warning("Skipping unsafe destination for album %r", album)
@@ -1731,6 +1854,11 @@ def process_track(
             # File is already in correct location - skip re-processing
             final_mp3 = path
     else:
+        if no_convert:
+            logging.debug("Skipping non-MP3 file (--no-convert): %s", path.name)
+            pending_tracks.pop(path, None)
+            return
+
         if not entry.asked_conversion:
             if not prompt_for_conversion(album, path, approved_conversions):
                 logging.info("Skipped conversion for %s", path.name)
@@ -2120,7 +2248,19 @@ def manage_album_ignorelist_interactive(root: Path) -> None:
     print(f"Album ignore list saved ({len(ignore_set)} entries).")
 
 
-def run_once(root: Path, dry_run: bool, hierarchy: bool, skip_art: bool, skip_cleanup: bool, ignore_list: Optional[set] = None, cleanup_cooldown: float = DEFAULT_CLEANUP_COOLDOWN_SECONDS) -> None:
+def run_once(
+    root: Path,
+    dry_run: bool,
+    hierarchy: bool,
+    skip_art: bool,
+    skip_cleanup: bool,
+    ignore_list: Optional[set] = None,
+    cleanup_cooldown: float = DEFAULT_CLEANUP_COOLDOWN_SECONDS,
+    no_convert: bool = False,
+    no_partial_album: bool = False,
+    no_partial_artist: bool = False,
+    safe: bool = False,
+) -> None:
     if ignore_list is None:
         ignore_list = set()
     ALBUM_IGNORE_ALL.update(load_album_ignore_list(root))
@@ -2161,7 +2301,13 @@ def run_once(root: Path, dry_run: bool, hierarchy: bool, skip_art: bool, skip_cl
                     continue
 
                 meta = ensure_albumartist(path, meta)
-                destination_dir, target_stem, is_orphan = get_destination_info(root, path, meta, hierarchy)
+                try:
+                    destination_dir, target_stem, is_orphan = get_destination_info(
+                        root, path, meta, hierarchy, no_partial_album, no_partial_artist, safe
+                    )
+                except SafeAbortError as exc:
+                    logging.warning("Safe-abort: held back '%s' — %s", path.name, exc)
+                    continue
 
                 if not within_root(destination_dir, root):
                     logging.warning("Skipping unsafe destination path for album %r", album)
@@ -2176,13 +2322,16 @@ def run_once(root: Path, dry_run: bool, hierarchy: bool, skip_art: bool, skip_cl
                     else:
                         final_mp3 = path
                 else:
+                    if no_convert:
+                        logging.debug("Skipping non-MP3 file (--no-convert): %s", path.name)
+                        continue
                     if prompt_for_conversion(album, path, approved_conversions):
                         if not skip_art:
                             move_associated_images(path.parent, destination_dir, dry_run)
                         final_mp3 = convert_to_mp3(path, destination_dir, target_stem, root, dry_run, meta)
                     else:
                         logging.info("Skipped conversion for %s", path.name)
-                        
+
                 if is_orphan and final_mp3:
                     logging.warning("Track '%s' has been orphaned at: %s", final_mp3.name, destination_dir)
 
@@ -2219,6 +2368,18 @@ def run_once(root: Path, dry_run: bool, hierarchy: bool, skip_art: bool, skip_cl
 
     logging.info("One-shot organization sequence completed.")
 
+    if safe and (SAFE_ARTIST_CONFLICTS or SAFE_ALBUM_CONFLICTS):
+        print(clr_yellow("\n[!] Safe-mode held back the following conflicts (not moved):"))
+        if SAFE_ARTIST_CONFLICTS:
+            print(clr_bold("\n  Artist conflicts (--no-partial-artist):"))
+            for i, (a, b) in enumerate(sorted(SAFE_ARTIST_CONFLICTS), 1):
+                print(f"    {i}. {clr_red(a)}  ~  {clr_green(b)}")
+        if SAFE_ALBUM_CONFLICTS:
+            print(clr_bold("\n  Album conflicts (--no-partial-album):"))
+            for i, (artist, album_new, album_existing) in enumerate(sorted(SAFE_ALBUM_CONFLICTS), 1):
+                artist_label = f"{clr_cyan(artist)} / " if artist else ""
+                print(f"    {i}. {artist_label}{clr_green(album_new)}  ~  {clr_red(album_existing)}")
+
 
 def main() -> int:
     args = parse_args()
@@ -2230,6 +2391,11 @@ def main() -> int:
         logging.error(str(exc))
         return 1
 
+    global _DRY_RUN
+    _DRY_RUN = args.dry_run
+    if _DRY_RUN:
+        logging.info("DRY-RUN mode: no files will be moved, created, or modified.")
+
     if args.manage_ignorelist:
         manage_ignorelist_interactive(root)
         return 0
@@ -2238,11 +2404,19 @@ def main() -> int:
         manage_album_ignorelist_interactive(root)
         return 0
 
-    ignore_list = load_ignore_list(root)
-    ALBUM_IGNORE_ALL.update(load_album_ignore_list(root))
+    ignore_list = load_ignore_list(root) if not args.no_folder_ignorelist else set()
+    if not args.no_album_ignorelist:
+        ALBUM_IGNORE_ALL.update(load_album_ignore_list(root))
 
     if args.once:
-        run_once(root, args.dry_run, args.hierarchy, args.skip_art, args.skip_cleanup, ignore_list, args.cleanup_cooldown)
+        run_once(
+            root, args.dry_run, args.hierarchy, args.skip_art, args.skip_cleanup,
+            ignore_list, args.cleanup_cooldown,
+            no_convert=args.no_convert,
+            no_partial_album=args.no_partial_album,
+            no_partial_artist=args.no_partial_artist,
+            safe=args.safe,
+        )
         return 0
 
     logging.info("Watching %s", root)
@@ -2359,14 +2533,18 @@ def main() -> int:
         for track_path in ready_tracks:
             try:
                 process_track(
-                    track_path, 
-                    root, 
-                    args.dry_run, 
-                    pending_items, 
-                    approved_conversions, 
-                    approved_art, 
-                    args.hierarchy, 
-                    args.skip_art
+                    track_path,
+                    root,
+                    args.dry_run,
+                    pending_items,
+                    approved_conversions,
+                    approved_art,
+                    args.hierarchy,
+                    args.skip_art,
+                    no_convert=args.no_convert,
+                    no_partial_album=args.no_partial_album,
+                    no_partial_artist=args.no_partial_artist,
+                    safe=args.safe,
                 )
                 did_process_something = True
             except Exception as exc:
