@@ -363,7 +363,6 @@ def is_image_file(path: Path) -> bool:
 
 def has_collision_suffix(filename: str) -> bool:
     """Check if filename has a collision suffix like ' (1)', ' (2)', etc."""
-    import re
     return bool(re.search(r'\s+\(\d+\)\.[^.]+$', filename))
 
 
@@ -880,11 +879,9 @@ def _resolve_album_partial_match(
     no_partial_album: bool = False,
     safe: bool = False,
 ) -> Optional[str]:
-    ignore_key = (artist_sanitized or "", album_sanitized)
-    if ignore_key in ALBUM_IGNORE_ALL:
-        return None
-
     cache_key = (artist_sanitized or "", album_sanitized)
+    if cache_key in ALBUM_IGNORE_ALL:
+        return None
     if cache_key in ALBUM_MERGE_DECISIONS:
         return ALBUM_MERGE_DECISIONS[cache_key]
 
@@ -915,7 +912,7 @@ def _resolve_album_partial_match(
         decision = prompt_album_merge(album_raw, existing_album, artist_sanitized or "", search_dir)
 
         if decision == "IGNORE_ALL":
-            ALBUM_IGNORE_ALL.add(ignore_key)
+            ALBUM_IGNORE_ALL.add(cache_key)
             save_album_ignore_list(root, ALBUM_IGNORE_ALL)
             logging.info("Ignoring all partial album matches for '%s' (saved).", album_raw)
             return None
@@ -1003,8 +1000,7 @@ def resolve_main_artist(
         
     if len(candidates) == 1:
         best_artist = list(candidates.keys())[0]
-        current_artist = sanitize_folder_name(meta.get("albumartist") or meta.get("artist") or "Unknown Artist")
-        
+
         # If auto-detected artist differs from track metadata, skip auto-move and require manual action
         if best_artist != current_artist and best_artist != "Unknown Artist":
             logging.warning(
@@ -1020,12 +1016,11 @@ def resolve_main_artist(
         # Still check for partial matches with existing root folders even in the single-candidate
         # case — e.g. "Limonène" tracks for a new album when "Limonene" folder already exists
         # for other albums (that folder never enters candidates because it lacks THIS album).
+        best_lower = best_artist.lower()
         partial_artist_matches = find_partial_artist_matches(root, best_artist)
         for other_artist in partial_artist_matches:
-            pair_key = (
-                min(best_artist.lower(), other_artist.lower()),
-                max(best_artist.lower(), other_artist.lower()),
-            )
+            other_lower = other_artist.lower()
+            pair_key = (min(best_lower, other_lower), max(best_lower, other_lower))
             if pair_key in ARTIST_PARTIAL_MATCH_ASKED:
                 continue
             ARTIST_PARTIAL_MATCH_ASKED.add(pair_key)
@@ -1051,10 +1046,11 @@ def resolve_main_artist(
     scores = {}
     for artist_name, tracks in candidates.items():
         scores[artist_name] = score_track_group(tracks, artist_name)
-        
-    best_artist = list(candidates.keys())[0]
+
+    candidate_keys = list(candidates.keys())
+    best_artist = candidate_keys[0]
     custom_albumartist = None
-    for artist_name in list(candidates.keys())[1:]:
+    for artist_name in candidate_keys[1:]:
         decision = evaluate_album_priority(scores[artist_name], scores[best_artist])
         if decision == 1:
             best_artist = artist_name
@@ -1075,13 +1071,12 @@ def resolve_main_artist(
 
     # Check for partial name matches among candidates (catches accent/diacritic variants
     # like "Limonene" vs "Limonène" where the incoming track has no folder yet)
-    for candidate_artist in list(candidates.keys()):
+    best_lower = best_artist.lower()
+    for candidate_artist in candidate_keys:
         if candidate_artist == best_artist:
             continue
-        pair_key = (
-            min(best_artist.lower(), candidate_artist.lower()),
-            max(best_artist.lower(), candidate_artist.lower()),
-        )
+        candidate_lower = candidate_artist.lower()
+        pair_key = (min(best_lower, candidate_lower), max(best_lower, candidate_lower))
         if pair_key in ARTIST_PARTIAL_MATCH_ASKED:
             continue
         if not strings_partially_match(candidate_artist, best_artist):
@@ -1109,12 +1104,11 @@ def resolve_main_artist(
             ALBUM_MAIN_ARTIST_CACHE[cache_key] = unified
 
     # Check for partial artist matches from existing root-level artist folders
+    best_lower = best_artist.lower()
     partial_artist_matches = find_partial_artist_matches(root, best_artist)
     for other_artist in partial_artist_matches:
-        pair_key = (
-            min(best_artist.lower(), other_artist.lower()),
-            max(best_artist.lower(), other_artist.lower()),
-        )
+        other_lower = other_artist.lower()
+        pair_key = (min(best_lower, other_lower), max(best_lower, other_lower))
         if pair_key in ARTIST_PARTIAL_MATCH_ASKED:
             continue
         ARTIST_PARTIAL_MATCH_ASKED.add(pair_key)
@@ -1475,10 +1469,12 @@ def move_associated_images(source_dir: Path, dest_dir: Path, dry_run: bool) -> N
     try:
         for p in source_dir.iterdir():
             if is_image_file(p):
-                dest_dir.mkdir(parents=True, exist_ok=True)
                 target = unique_destination_path(dest_dir, p.stem, p.suffix)
-                if not dry_run:
-                    shutil.move(str(p), str(target))
+                if dry_run:
+                    logging.info("DRY-RUN: would move album art %s -> %s", p.name, dest_dir.name)
+                    continue
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(p), str(target))
                 logging.info("Moved associated album art: %s -> %s", p.name, target.parent.name)
     except OSError:
         pass
@@ -1963,16 +1959,14 @@ def prompt_root_image_destination(img_path: Path, root: Path) -> Optional[Path]:
             except OSError:
                 pass
 
-            # Fuzzy-rank by folder name match
-            def score(folder: Path) -> float:
-                return difflib.SequenceMatcher(
-                    None,
-                    _normalize_for_comparison(query),
-                    _normalize_for_comparison(folder.name),
-                ).ratio()
-
-            ranked = sorted(candidates, key=score, reverse=True)
-            matches = [f for f in ranked if score(f) >= 0.4][:10]
+            # Fuzzy-rank by folder name match — score each candidate once
+            query_norm = _normalize_for_comparison(query)
+            scored = sorted(
+                ((difflib.SequenceMatcher(None, query_norm, _normalize_for_comparison(f.name)).ratio(), f)
+                 for f in candidates),
+                reverse=True,
+            )
+            matches = [f for s, f in scored if s >= 0.4][:10]
 
             if not matches:
                 print("  No matches found. Try a different query.")
@@ -2105,7 +2099,11 @@ def cleanup_stale_folders(
                 except OSError:
                     pass
         else:
-            has_media = any(is_audio_file(f) or is_zip_file(f) or is_image_file(f) for f in current.rglob("*"))
+            try:
+                all_files = [f for f in current.rglob("*") if f.is_file()]
+            except OSError:
+                continue
+            has_media = any(is_audio_file(f) or is_zip_file(f) or is_image_file(f) for f in all_files)
             if has_media:
                 # Media present — reset any cooldown timer for this folder
                 folder_seen_times.pop(current, None)
@@ -2126,11 +2124,7 @@ def cleanup_stale_folders(
             except ValueError:
                 rel_display = current.name
 
-            # List the actual files so the user knows what they're deleting
-            try:
-                non_media_files = sorted(f.name for f in current.rglob("*") if f.is_file())
-            except OSError:
-                non_media_files = []
+            non_media_files = sorted(f.name for f in all_files)
 
             print(f"\nFolder '{rel_display}' contains only non-media files:")
             for name in non_media_files:
@@ -2140,6 +2134,7 @@ def cleanup_stale_folders(
 
             if ans in {"y", "yes"}:
                 try:
+                    # Re-scan after prompt in case media appeared while waiting for input
                     fresh_media = any(
                         f.is_file() and (is_audio_file(f) or is_zip_file(f) or is_image_file(f))
                         for f in current.rglob("*")
@@ -2254,6 +2249,18 @@ def manage_album_ignorelist_interactive(root: Path) -> None:
     print(f"Album ignore list saved ({len(ignore_set)} entries).")
 
 
+def _update_multidisc_cache(tracks: Iterable[Path]) -> None:
+    """Populate ALBUM_MULTI_DISC_CACHE from track metadata."""
+    for path in tracks:
+        meta = get_cached_metadata(path)
+        album = meta.get("album")
+        if album and not ALBUM_MULTI_DISC_CACHE.get(album):
+            d_num = meta.get("disc_num")
+            d_tot = meta.get("disc_total")
+            if (d_tot and d_tot.isdigit() and int(d_tot) > 1) or (d_num and d_num.isdigit() and int(d_num) > 1):
+                ALBUM_MULTI_DISC_CACHE[album] = True
+
+
 def run_once(
     root: Path,
     dry_run: bool,
@@ -2288,14 +2295,7 @@ def run_once(
     
     if audio_files:
         logging.info("Pre-scanning metadata to reliably identify multi-disc albums...")
-        for path in audio_files:
-            meta = get_cached_metadata(path)
-            album = meta.get("album")
-            if album and not ALBUM_MULTI_DISC_CACHE.get(album):
-                d_num = meta.get("disc_num")
-                d_tot = meta.get("disc_total")
-                if (d_tot and d_tot.isdigit() and int(d_tot) > 1) or (d_num and d_num.isdigit() and int(d_num) > 1):
-                    ALBUM_MULTI_DISC_CACHE[album] = True
+        _update_multidisc_cache(audio_files)
 
         logging.info("Analyzing metadata and organizing %d track(s)...", len(audio_files))
         for path in audio_files:
@@ -2527,14 +2527,7 @@ def main() -> int:
         ]
 
         if ready_tracks:
-            for track_path in ready_tracks:
-                meta = get_cached_metadata(track_path)
-                album = meta.get("album")
-                if album and not ALBUM_MULTI_DISC_CACHE.get(album):
-                    d_num = meta.get("disc_num")
-                    d_tot = meta.get("disc_total")
-                    if (d_tot and d_tot.isdigit() and int(d_tot) > 1) or (d_num and d_num.isdigit() and int(d_num) > 1):
-                        ALBUM_MULTI_DISC_CACHE[album] = True
+            _update_multidisc_cache(ready_tracks)
 
         for track_path in ready_tracks:
             try:
