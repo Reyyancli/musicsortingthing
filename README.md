@@ -14,6 +14,11 @@ Below are the tags which are emphesized in this script:
 - Track Name
 - Track Artist
 
+### Requirements
+
+- Python
+- mutagen for Python
+
 ## Installation
 
 You don't really have to install to use the script but I included it anyway to make it easier.
