@@ -459,7 +459,7 @@ def scan_for_changes(
 
 
 def sanitize_folder_name(name: str) -> str:
-    cleaned = name.strip()
+    cleaned = unicodedata.normalize("NFC", name.strip())
     cleaned = re.sub(r"[\x00-\x1f\\/:*?\"<>|]", "_", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
     if not cleaned or cleaned.upper() in _WINDOWS_RESERVED:
@@ -468,7 +468,7 @@ def sanitize_folder_name(name: str) -> str:
 
 
 def sanitize_file_name(name: str) -> str:
-    cleaned = name.strip()
+    cleaned = unicodedata.normalize("NFC", name.strip())
     cleaned = re.sub(r"[\x00-\x1f\\/:*?\"<>|]", "_", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned or "Unknown"
@@ -783,6 +783,14 @@ def find_partial_artist_matches(root: Path, artist_name: str) -> list:
             if child.name.lower() == artist_name.lower():
                 continue
             if strings_partially_match(child.name, artist_name):
+                # Skip artist folders that contain only orphaned tracks — they are
+                # orphan-holder folders, not real artists in the library.
+                has_real_track = any(
+                    f.is_file() and is_audio_file(f) and "Orphan" not in f.parts
+                    for f in child.rglob("*")
+                )
+                if not has_real_track:
+                    continue
                 matches.append(child.name)
     except OSError:
         pass
@@ -1040,12 +1048,14 @@ def resolve_main_artist(
                     # These are leftover from previous conflicts and should not be candidates
                     if "_" in artist_name and not artist_name == current_artist:
                         continue
-                    if artist_name not in candidates:
-                        candidates[artist_name] = []
-                    for f in album_dir.rglob("*"):
-                        if f.is_file() and is_audio_file(f):
-                            if f.resolve() != current_track.resolve():
-                                candidates[artist_name].append(f)
+                    non_orphan = [
+                        f for f in album_dir.rglob("*")
+                        if f.is_file() and is_audio_file(f)
+                        and "Orphan" not in f.parts
+                        and f.resolve() != current_track.resolve()
+                    ]
+                    if non_orphan:
+                        candidates[artist_name] = candidates.get(artist_name, []) + non_orphan
     except OSError:
         pass
         
@@ -1558,6 +1568,12 @@ def move_file(path: Path, destination_dir: Path, target_stem: str, root: Path, d
         raise RuntimeError(f"Refusing to move outside root: {destination}")
 
     if path.resolve() == destination.resolve():
+        return destination
+
+    # Also treat NFC-equivalent paths as identical (handles SMB/NFS servers that
+    # normalize filenames; without this the script loops forever renaming NFD→NFC→NFD).
+    _nfc = unicodedata.normalize
+    if _nfc("NFC", str(path.resolve())) == _nfc("NFC", str(destination.resolve())):
         return destination
 
     if dry_run:
