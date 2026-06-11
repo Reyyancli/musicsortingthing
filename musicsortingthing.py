@@ -2176,6 +2176,15 @@ def cleanup_stale_folders(
             continue
 
         if not contents:
+            # Re-scan with rglob before deleting — mirrors the prompted-path's
+            # fresh_media guard and catches stale network-filesystem caches as
+            # well as the topdown=False cascade (a sibling deletion can make a
+            # parent look empty to iterdir without a deeper check).
+            try:
+                if any(True for _ in current.rglob("*")):
+                    continue
+            except OSError:
+                continue
             logging.info("Cleaning up empty folder: %s", current.name)
             if not dry_run:
                 try:
