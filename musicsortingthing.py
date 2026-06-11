@@ -132,6 +132,9 @@ _REPROCESS_ORPHANS: bool = False
 _METADATA_CACHE_MAX = 5_000   # evict oldest entry beyond this
 _MAX_SETTLE_SECONDS = 60.0    # process a file even if still changing after this long
 
+_moved_sources: set = set()   # paths removed by the script this cycle (suppresses spurious "Removed:" logs)
+_moved_dests: set = set()     # paths created by the script this cycle (suppresses spurious "Added:" logs)
+
 
 class SafeAbortError(Exception):
     """Raised in --safe mode when a partial-match check is disabled and a conflict is detected."""
@@ -342,11 +345,15 @@ class _ColorFormatter(logging.Formatter):
         msg = super().format(record)
         if not _COLOR:
             return msg
-        # Color only the levelname token, leave the timestamp plain
         color = self._LEVEL_COLORS.get(record.levelno, "0")
         colored_level = f"\033[{color}m{record.levelname}\033[0m"
-        # The formatted string contains the literal levelname; replace first occurrence
-        return msg.replace(record.levelname, colored_level, 1)
+        formatted = msg.replace(record.levelname, colored_level, 1)
+        if record.levelno == logging.INFO and record.getMessage().startswith(
+            ("Moved ", "Converted ", "Applied artwork", "Updated ")
+        ):
+            idx = formatted.rfind("| ") + 2
+            formatted = formatted[:idx] + f"\033[33m{formatted[idx:]}\033[0m"
+        return formatted
 
 
 def configure_logging(level_name: str) -> None:
@@ -482,8 +489,8 @@ def extract_track_and_title(raw_title: str) -> tuple[Optional[str], str]:
         r'(?:(\d{1,2})[-_])?'          
         r'(\d{1,4})'                   
         r'[\]\)]?'                     
-        r'[\s\.\-_]*'                  
-        r'(?:-[\s]+)?'                 
+        r'[\s\.\-_]+'
+        r'(?:-[\s]+)?'
         r'(.*)'                        
         , re.IGNORECASE
     )
@@ -1557,6 +1564,8 @@ def move_file(path: Path, destination_dir: Path, target_stem: str, root: Path, d
         logging.info("DRY-RUN: move %s -> %s", path, destination)
         return destination
 
+    _moved_sources.add(path)
+    _moved_dests.add(destination)
     shutil.move(str(path), str(destination))
     logging.info("Moved %s -> %s", path, destination)
     if "Orphan" not in destination.parts:
@@ -1666,6 +1675,8 @@ def convert_to_mp3(source: Path, destination_dir: Path, target_stem: str, root: 
             )
             return final_output
 
+        _moved_sources.add(source)
+        _moved_dests.add(final_output)
         source.unlink()
         logging.info("Converted %s -> %s and retained album art", source.name, final_output.name)
         if "Orphan" not in final_output.parts:
@@ -2579,11 +2590,15 @@ def main() -> int:
 
             if added or removed or modified:
                 for path in added:
-                    logging.info("Added: %s", path)
+                    if path not in _moved_dests:
+                        logging.info("Added: %s", path)
                 for path in modified:
                     logging.info("Modified: %s", path)
                 for path in removed:
-                    logging.info("Removed: %s", path)
+                    if path not in _moved_sources:
+                        logging.info("Removed: %s", path)
+                _moved_dests.difference_update(added)
+                _moved_sources.difference_update(removed)
 
             for archive_path in list(current_snapshot.keys()):
                 if not is_zip_file(archive_path):
