@@ -1,4 +1,5 @@
-## THIS PYTHON SCRIPT IS ENTIRELY VIBECODED. EXPECT BUGS
+## THIS PYTHON SCRIPT IS ENTIRELY VIBECODED AND I DON"T CONDONE USING IT.
+I only put it up here cause why not
 
 # musicsortingthing
 ![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
